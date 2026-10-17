@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flipscan"
+version = "0.1.0"
+description = "Turn a video of someone flipping through a book into clean, dewarped, OCR'd page scans."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.22",
+    "opencv-python-headless>=4.6",
+    "rapidocr>=2.0",
+    "onnxruntime>=1.14",
+]
+
+[project.optional-dependencies]
+pdf = ["reportlab>=3.6"]
+test = ["pytest>=7"]
+
+[project.scripts]
+flipscan = "flipscan.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
