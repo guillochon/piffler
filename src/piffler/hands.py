@@ -180,8 +180,18 @@ def remove_fingers(ref: np.ndarray, others: List[np.ndarray], region: Optional[n
         return ref, np.zeros(ref.shape[:2], np.uint8), stats
     h, w = ref.shape[:2]
     stats["finger_px_frac"] = total / float(region.sum() / 255 if region is not None else h * w)
-    pad = max(3, int(0.006 * max(h, w)))
-    need = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * pad + 1, 2 * pad + 1)))
+    pad = max(3, int(0.012 * max(h, w)))  # the hand's blurred edge is wider than it looks
+    core = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * pad + 1, 2 * pad + 1)))
+    # the hand's cast shadow: paper near it that is smoothly darker than the page's paper
+    R = max(5, int(0.025 * max(h, w)))
+    near = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * R + 1, 2 * R + 1)))
+    L = cv2.cvtColor(ref, cv2.COLOR_BGR2LAB)[..., 0]
+    bgL = cv2.morphologyEx(L, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))  # paper level, print removed
+    paper = paper_color_lab(ref, region)
+    shadow = ((near > 0) & (core == 0) & (bgL < paper[0] - 6)).astype(np.uint8) * 255
+    if region is not None:
+        shadow = cv2.bitwise_and(shadow, region)
+    need = cv2.bitwise_or(core, shadow)
     out = ref.copy()
     remaining = need.copy()
 
@@ -194,7 +204,7 @@ def remove_fingers(ref: np.ndarray, others: List[np.ndarray], region: Optional[n
         if H is None:
             continue
         warped = cv2.warpPerspective(o, H, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-        okm = cv2.warpPerspective(cv2.bitwise_not(cv2.dilate(omask, np.ones((2 * pad + 1,) * 2, np.uint8))),
+        okm = cv2.warpPerspective(cv2.bitwise_not(cv2.dilate(omask, np.ones((2 * R + 1,) * 2, np.uint8))),
                                   H, (w, h), flags=cv2.INTER_NEAREST, borderValue=0)
         # require the donor to agree with the reference just around the hand: a
         # frame that aligned badly (the book shifted, the page flexed) would paste
@@ -234,7 +244,9 @@ def remove_fingers(ref: np.ndarray, others: List[np.ndarray], region: Optional[n
             remaining[fillable] = 0
             stats["filled_from_frames"] = float(fillable.sum()) / max(1, (need > 0).sum())
 
-    residual = remaining
+    # a shadow no frame could fill stays: lighting correction evens out smooth
+    # shading, while painting paper there would erase any print beneath it
+    residual = cv2.bitwise_and(remaining, core)
     if residual.any():
         out = fill_with_paper(out, residual)
     if region is not None:

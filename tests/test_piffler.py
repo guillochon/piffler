@@ -125,12 +125,16 @@ def test_clean_scan_makes_paper_white_and_text_dark():
     rng = np.random.default_rng(1)
     canvas = np.clip(rng.normal(130, 35, (800, 580, 1)), 0, 255).astype(np.uint8).repeat(3, 2)  # countertop
     canvas[40:760, 40:540] = dim
-    out = clean_scan(canvas, upscale=1.0)
+    out = clean_scan(canvas, upscale=1.0, style="bw")
     assert out.ndim == 2
     inner = out[100:700, 100:480]
     assert np.median(inner) == 255                            # paper is white
     assert (inner < 80).mean() > 0.01                         # text is dark
     assert (out[:30] == 255).mean() > 0.95                    # countertop is gone
+    nat = cv2.cvtColor(clean_scan(canvas, upscale=1.0), cv2.COLOR_BGR2GRAY)  # natural: the paper's own tone
+    inner = nat[100:700, 100:480]
+    assert 225 <= np.median(inner) < 255                      # bright, but not blown out
+    assert (inner < 80).mean() > 0.01
 
 
 def test_pale_hand_is_skin_on_white_paper():

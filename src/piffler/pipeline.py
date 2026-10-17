@@ -369,6 +369,8 @@ def _process_segment(si: int, seg: Segment, frames: Dict[int, np.ndarray], cfg: 
             except Exception as e:
                 log.warning("dewarp failed on segment %d: %s", si, e)
                 pf.append("dewarp_failed")
+        if debug_dir:  # before lighting correction, to tune what comes after
+            cv2.imwrite(os.path.join(debug_dir, f"seg{si:04d}_{hi}_raw.png"), page)
         page = flatten_illumination(page)
         words: List[Word] = []
         if engine is not None:
@@ -575,10 +577,16 @@ def process_video(video_path: str, out_dir: str, cfg: Optional[Config] = None,
             r.image_path = r.photo_path
             if cfg.scan:
                 try:
-                    r.image_path = os.path.join(out_pages, f"page_{n:04d}.png")
                     side = {"left": "right", "right": "left"}.get(r.info.get("half"))  # binding side
-                    cv2.imwrite(r.image_path, clean_scan(img, upscale=cfg.scan_upscale, gutter=side,
-                                                           overlap=r.info.get("overlap_px", 0)))
+                    sc = clean_scan(img, upscale=cfg.scan_upscale, gutter=side,
+                                    overlap=r.info.get("overlap_px", 0), style=cfg.scan_style,
+                                    word_boxes=[w.box for w in r.words] or None)
+                    if cfg.scan_style == "bw":  # flat tones: PNG is small and exact
+                        r.image_path = os.path.join(out_pages, f"page_{n:04d}.png")
+                        cv2.imwrite(r.image_path, sc)
+                    else:  # natural tones and photos: JPEG keeps the PDF a sensible size
+                        r.image_path = os.path.join(out_pages, f"page_{n:04d}.jpg")
+                        cv2.imwrite(r.image_path, sc, [cv2.IMWRITE_JPEG_QUALITY, 92])
                     r.image_scale = cfg.scan_upscale
                 except Exception as e:  # the photo is still there
                     log.warning("scan cleanup failed on page %d: %s", n, e)

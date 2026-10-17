@@ -170,15 +170,14 @@ def dewarp(img: np.ndarray, work_height: int = 1400) -> Tuple[np.ndarray, dict]:
 
 
 def flatten_illumination(img: np.ndarray, strength: float = 1.0) -> np.ndarray:
-    """Even out shadows (gutter shading, uneven lamp light) while keeping colour."""
-    h, w = img.shape[:2]
-    s = min(1.0, 600.0 / max(h, w))
-    small = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
-    k = max(9, int(min(small.shape[:2]) / 20) | 1)
-    bg = cv2.morphologyEx(small, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
-    bg = cv2.GaussianBlur(bg, (0, 0), k / 3)
-    bg = cv2.resize(bg, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
-    target = np.percentile(bg.reshape(-1, 3), 90, axis=0)
+    """Even out shadows (gutter shading, uneven lamp light) while keeping colour.
+    Pictures are left as they are: the paper's light is carried across them."""
+    from .scan import paper_background, picture_mask
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    pics = picture_mask(gray)
+    bg = paper_background(img, pics, long_side=600)
+    paper_px = bg[~pics] if (~pics).any() else bg.reshape(-1, 3)
+    target = np.percentile(paper_px.reshape(-1, 3), 90, axis=0)
     # lift underexposed pages so paper ends up near white, keeping its tint
     lum = float(target.mean())
     if lum < 225:
@@ -188,3 +187,4 @@ def flatten_illumination(img: np.ndarray, strength: float = 1.0) -> np.ndarray:
     gain = 1 + strength * (gain - 1)
     out = img.astype(np.float32) * gain
     return np.clip(out, 0, 255).astype(np.uint8)
+

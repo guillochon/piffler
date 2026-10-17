@@ -41,6 +41,7 @@ class Config:
     jpeg_quality: int = 92
     scan: bool = True                 # clean, high-contrast page scans (used in the PDF)
     scan_upscale: float = 2.0         # scans are this much larger than the page photo
+    scan_style: str = "natural"       # "natural" (the page's own tones) or "bw" (crisp black on white)
     gpu: bool = True                  # decode video and run OCR on the GPU when one is available
     max_pages: int = 0                # stop after this many pages (0 = whole book)
 
