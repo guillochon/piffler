@@ -12,7 +12,11 @@ dependencies = [
     "numpy>=1.22",
     "opencv-python-headless>=4.6",
     "rapidocr>=2.0",
-    "onnxruntime>=1.14",
+    # DirectML runs OCR on any DirectX 12 GPU and falls back to the CPU on its own;
+    # elsewhere the stock build (with CoreML on macOS). For NVIDIA GPUs on Linux,
+    # swap in onnxruntime-gpu: pip uninstall onnxruntime && pip install onnxruntime-gpu
+    "onnxruntime-directml>=1.17; sys_platform == 'win32'",
+    "onnxruntime>=1.14; sys_platform != 'win32'",
 ]
 
 [project.optional-dependencies]

@@ -104,7 +104,7 @@ def detect_page(img: np.ndarray, prior: Optional[np.ndarray] = None) -> Tuple[np
 
     L = cv2.cvtColor(small, cv2.COLOR_BGR2LAB)[..., 0]
     try:
-        sk = skin_mask(small)
+        sk = skin_mask(small, pale=True)
     except Exception:
         sk = None
     pr = None
@@ -320,6 +320,9 @@ def split_pages(img: np.ndarray, layout: str = "auto",
     if hint is not None and (conf < 0.5 or x is None or abs(x / float(w) - hint) > 0.08):
         x2, conf2 = find_gutter(img, max(0.2, hint - 0.06), min(0.8, hint + 0.06))
         log.debug("gutter near hint: x=%s (%.3f) conf=%.2f", x2, (x2 or 0) / float(w), conf2)
+        lo_, hi_ = max(0.2, hint - 0.06), min(0.8, hint + 0.06)
+        if x2 is not None and min(abs(x2 / float(w) - lo_), abs(x2 / float(w) - hi_)) < 0.012:
+            x2 = None  # pinned to the window's edge: it is climbing toward the impostor outside
         if x2 is None:
             x, conf = int(round(hint * w)), 0.0
         else:  # best spot near the usual gutter, trusted only as far as it's visible

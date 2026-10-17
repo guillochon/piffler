@@ -16,7 +16,8 @@ class Config:
 
     # --- duplicate handling ----------------------------------------------
     dedupe: bool = True
-    dedupe_similarity: float = 0.12   # ORB inlier ratio above which two holds are the same page
+    dedupe_similarity: float = 0.06   # ORB inlier ratio above which two holds are the same page
+                                      # (real footage: same page 0.08-0.7, different pages < 0.02)
 
     # --- page geometry ----------------------------------------------------
     layout: str = "auto"              # "auto" | "single" | "spread" (two pages per frame)
@@ -38,6 +39,9 @@ class Config:
     save_debug: bool = False
     pdf: bool = True
     jpeg_quality: int = 92
+    scan: bool = True                 # clean, high-contrast page scans (used in the PDF)
+    scan_upscale: float = 2.0         # scans are this much larger than the page photo
+    gpu: bool = True                  # decode video and run OCR on the GPU when one is available
     max_pages: int = 0                # stop after this many pages (0 = whole book)
 
     extra: dict = field(default_factory=dict)

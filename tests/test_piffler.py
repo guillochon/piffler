@@ -21,6 +21,7 @@ from piffler.dewarp import dewarp, find_lines, text_mask  # noqa: E402
 from piffler.hands import skin_mask  # noqa: E402
 from piffler.ocr import Word, reading_order, words_to_text  # noqa: E402
 from piffler.page import detect_page, split_pages  # noqa: E402
+from piffler.scan import clean_scan  # noqa: E402
 from piffler.pipeline import process_video  # noqa: E402
 from piffler.video import VideoError, VideoSource  # noqa: E402
 
@@ -115,6 +116,47 @@ def test_analysis_is_reused(tmp_path, monkeypatch):
     monkeypatch.setattr(pl, "analyze", boom)
     again = process_video(p, out, Config(ocr=False, pdf=False))
     assert len(again) == len(first)
+
+
+def test_clean_scan_makes_paper_white_and_text_dark():
+    page, _ = mtv.render_page(*mtv.TEXTS[0], 11)
+    page = cv2.resize(page, (500, 720))
+    dim = (page.astype(np.float32) * 0.8 + 25).astype(np.uint8)  # grey, low-contrast photo
+    rng = np.random.default_rng(1)
+    canvas = np.clip(rng.normal(130, 35, (800, 580, 1)), 0, 255).astype(np.uint8).repeat(3, 2)  # countertop
+    canvas[40:760, 40:540] = dim
+    out = clean_scan(canvas, upscale=1.0)
+    assert out.ndim == 2
+    inner = out[100:700, 100:480]
+    assert np.median(inner) == 255                            # paper is white
+    assert (inner < 80).mean() > 0.01                         # text is dark
+    assert (out[:30] == 255).mean() > 0.95                    # countertop is gone
+
+
+def test_pale_hand_is_skin_on_white_paper():
+    img = np.full((600, 400, 3), 235, np.uint8)               # white paper filling the frame
+    lab = np.uint8([[[205 * 255 // 255, 128 + 5, 128 + 10]]])
+    skin = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)[0, 0]          # washed-out skin: a*~5, b*~10
+    cv2.ellipse(img, (0, 300), (160, 60), 0, 0, 360, skin.tolist(), -1)  # a hand coming in from the side
+    assert (skin_mask(img) > 0).mean() < 0.01                 # too pale for the strict colour test
+    assert (skin_mask(img, pale=True)[300, 60:140] > 0).all()
+
+
+def test_ffmpeg_reader_matches_opencv(tmp_path):
+    frames, _ = _page_frames(2)
+    p = _write(str(tmp_path / "v.mp4"), frames)
+    src = VideoSource(p)
+    if src.decoder == "opencv":
+        pytest.skip("ffmpeg not available")
+    idx = [0, 17, 40]
+    ff = src.fetch(idx)
+    cap = cv2.VideoCapture(p)
+    for i in range(max(idx) + 1):
+        ok, f = cap.read()
+        if i in idx:
+            assert np.abs(f.astype(int) - ff[i].astype(int)).mean() < 6
+    steps = [i for i, _ in src.frames(3, width=200)]
+    assert steps[:3] == [0, 3, 6]
 
 
 # ---------------------------------------------------------------- bad files

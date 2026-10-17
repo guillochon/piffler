@@ -18,11 +18,13 @@ def main(argv=None):
                     help="force rotation if the video is sideways (default: auto-detect)")
     ap.add_argument("--min-hold", type=float, default=0.35, help="seconds a page must be still")
     ap.add_argument("--max-pages", type=int, default=0, help="stop after N pages (default: all)")
+    ap.add_argument("--cpu", action="store_true", help="don't use the GPU even if one is available")
     ap.add_argument("--no-ocr", action="store_true")
     ap.add_argument("--no-dewarp", action="store_true")
     ap.add_argument("--no-fingers", action="store_true", help="don't attempt finger removal")
     ap.add_argument("--no-dedupe", action="store_true")
     ap.add_argument("--no-pdf", action="store_true")
+    ap.add_argument("--no-scan", action="store_true", help="use the page photos instead of clean scans")
     ap.add_argument("--debug", action="store_true", help="save intermediate images and stats")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
@@ -30,7 +32,7 @@ def main(argv=None):
                         format="%(levelname)s %(name)s: %(message)s")
     cfg = Config(layout=a.layout, rotate=a.rotate, min_hold_s=a.min_hold, ocr=not a.no_ocr,
                  dewarp=not a.no_dewarp, remove_fingers=not a.no_fingers, dedupe=not a.no_dedupe,
-                 pdf=not a.no_pdf, save_debug=a.debug, max_pages=a.max_pages)
+                 pdf=not a.no_pdf, save_debug=a.debug, max_pages=a.max_pages, gpu=not a.cpu, scan=not a.no_scan)
     from .pipeline import process_video
     from .video import VideoError
     last = [None]

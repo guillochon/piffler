@@ -53,7 +53,7 @@ def analyze(src: VideoSource, cfg: Config, progress=None) -> FrameStats:
     idxs, motion, sharp, bright, clip, skin = [], [], [], [], [], []
     prev = None
     aw = cfg.analysis_width
-    for i, frame in src.frames(step):
+    for i, frame in src.frames(step, width=2 * aw):  # all analysis needs; ffmpeg scales on the GPU
         h, w = frame.shape[:2]
         s = aw / float(w)
         small = cv2.resize(frame, (aw, max(8, int(round(h * s)))), interpolation=cv2.INTER_AREA)

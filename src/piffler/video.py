@@ -70,10 +70,95 @@ def _transcode(path: str) -> Optional[str]:
     return out if os.path.exists(out) and os.path.getsize(out) > 0 else None
 
 
+class _FFmpeg:
+    """Frames straight from ffmpeg: multi-threaded, on the GPU (NVDEC) when it can.
+
+    OpenCV decodes on one thread and hands over full frames, so a 4K phone
+    video spends most of its time decoding and shrinking pixels that analysis
+    throws away. ffmpeg picks frames and scales them before they reach Python.
+    """
+
+    _cuda_ok: dict = {}
+
+    def __init__(self, path: str, use_gpu: bool = True):
+        self.exe = shutil.which("ffmpeg")
+        probe = shutil.which("ffprobe")
+        if not self.exe or not probe:
+            raise VideoError("ffmpeg not found")
+        import json
+        try:
+            out = subprocess.run([probe, "-v", "error", "-select_streams", "v:0", "-show_streams", "-of", "json", path],
+                                 capture_output=True, text=True, timeout=60).stdout
+            st = json.loads(out)["streams"][0]
+        except Exception as e:
+            raise VideoError(f"ffprobe failed: {e}")
+        self.path = path
+        self.w, self.h = int(st["width"]), int(st["height"])
+        # clockwise turn needed for display: the display matrix states it
+        # counter-clockwise, the older "rotate" tag clockwise
+        self.cw = int(st.get("tags", {}).get("rotate", 0) or 0) % 360
+        for sd in st.get("side_data_list", []):
+            if sd.get("rotation") is not None:
+                self.cw = (-int(round(float(sd["rotation"])))) % 360
+        self.cw = self.cw if self.cw in _ROT else 0
+        self.gpu = use_gpu and self._has_cuda()
+
+    def _has_cuda(self) -> bool:
+        if self.path not in _FFmpeg._cuda_ok:
+            cmd = [self.exe, "-v", "error", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-i", self.path,
+                   "-frames:v", "1", "-vf", "scale_cuda=64:64:format=yuv420p,hwdownload,format=yuv420p",
+                   "-f", "null", "-"]
+            try:
+                r = subprocess.run(cmd, capture_output=True, timeout=60)
+                _FFmpeg._cuda_ok[self.path] = r.returncode == 0
+            except Exception:
+                _FFmpeg._cuda_ok[self.path] = False
+            log.info("GPU video decoding: %s", "on" if _FFmpeg._cuda_ok[self.path] else "off")
+        return _FFmpeg._cuda_ok[self.path]
+
+    def read(self, select: str, width: Optional[int] = None, extra_cw: int = 0, limit: Optional[int] = None):
+        """Yield frames passing ffmpeg's `select` expression, `width` pixels wide
+        after rotation (full size when None), as uint8 BGR."""
+        turn = (self.cw + extra_cw) % 360
+        sw, sh = (self.w, self.h)
+        if width:
+            # target size before rotation; even numbers keep the scaler happy
+            if turn in (90, 270):
+                sh = int(width) // 2 * 2
+                sw = int(round(self.w * sh / self.h)) // 2 * 2
+            else:
+                sw = int(width) // 2 * 2
+                sh = int(round(self.h * sw / self.w)) // 2 * 2
+        if self.gpu:
+            pre = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+            vf = f"select='{select}',scale_cuda={sw}:{sh}:format=yuv420p,hwdownload,format=yuv420p"
+        else:
+            pre = ["-threads", "0"]
+            vf = f"select='{select}'" + (f",scale={sw}:{sh}:flags=area" if width else "")
+        cmd = [self.exe, "-v", "error", "-nostdin", "-noautorotate", *pre, "-i", self.path, "-an", "-vf", vf,
+               "-fps_mode", "passthrough", "-pix_fmt", "bgr24", "-f", "rawvideo"]
+        if limit:
+            cmd += ["-frames:v", str(limit)]
+        p = subprocess.Popen(cmd + ["-"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        size = sw * sh * 3
+        r = _ROT[turn]
+        try:
+            while True:
+                buf = p.stdout.read(size)
+                if len(buf) < size:
+                    break
+                f = np.frombuffer(buf, np.uint8).reshape(sh, sw, 3)
+                yield cv2.rotate(f, r) if r is not None else f.copy()
+        finally:
+            p.stdout.close()
+            p.kill()
+            p.wait()
+
+
 class VideoSource:
     """Sequential, fault-tolerant reader. Use ``frames()`` or ``fetch()``."""
 
-    def __init__(self, path: str, rotate: int = 0, max_bad_reads: int = 30):
+    def __init__(self, path: str, rotate: int = 0, max_bad_reads: int = 30, use_gpu: bool = True):
         if not os.path.exists(path):
             raise VideoError(f"File not found: {path}")
         if os.path.getsize(path) == 0:
@@ -113,6 +198,22 @@ class VideoSource:
         n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         cap.release()
         self.info = VideoInfo(path, float(fps), f0.shape[1], f0.shape[0], max(n, 0))
+        self._ff = self._try_ffmpeg(f0, use_gpu)
+        self.decoder = ("ffmpeg-gpu" if self._ff.gpu else "ffmpeg") if self._ff else "opencv"
+
+    def _try_ffmpeg(self, f0: np.ndarray, use_gpu: bool) -> Optional[_FFmpeg]:
+        """ffmpeg reader, if it sees the same frames OpenCV does."""
+        try:
+            ff = _FFmpeg(self.path, use_gpu)
+            first = next(ff.read(r"eq(n\,0)", extra_cw=self.rotate, limit=1), None)
+        except Exception as e:
+            log.debug("ffmpeg reader unavailable: %s", e)
+            return None
+        if first is None or first.shape != f0.shape:
+            log.debug("ffmpeg frames %s don't match OpenCV's %s; using OpenCV",
+                      None if first is None else first.shape, f0.shape)
+            return None
+        return ff
 
     # -- helpers ----------------------------------------------------------
     def _prep(self, frame: np.ndarray) -> np.ndarray:
@@ -125,13 +226,28 @@ class VideoSource:
         r = _ROT[self.rotate]
         return cv2.rotate(frame, r) if r is not None else frame
 
-    def frames(self, step: int = 1) -> Iterator[Tuple[int, np.ndarray]]:
-        """Yield (frame_index, BGR frame) for every ``step``-th decodable frame.
+    def frames(self, step: int = 1, width: Optional[int] = None) -> Iterator[Tuple[int, np.ndarray]]:
+        """Yield (frame_index, BGR frame) for every ``step``-th decodable frame,
+        scaled to ``width`` pixels wide when given.
 
         Undecodable frames are skipped; a long run of failures is treated as
         the end of a truncated file rather than an error.
         """
         step = max(1, int(step))
+        if self._ff is not None:
+            k = -1
+            for k, f in enumerate(self._ff.read(rf"not(mod(n\,{step}))", width, self.rotate)):
+                yield k * step, f
+            if k >= 0:
+                return
+            log.warning("ffmpeg returned no frames; falling back to OpenCV")
+        for idx, f in self._frames_cv(step):
+            if width and f.shape[1] != width:
+                f = cv2.resize(f, (int(width), max(8, int(round(f.shape[0] * width / f.shape[1])))),
+                               interpolation=cv2.INTER_AREA)
+            yield idx, f
+
+    def _frames_cv(self, step: int) -> Iterator[Tuple[int, np.ndarray]]:
         cap = _open(self.path)
         idx, bad = -1, 0
         try:
@@ -169,6 +285,17 @@ class VideoSource:
         wanted = sorted(set(int(i) for i in indices))
         if not wanted:
             return
+        if self._ff is not None:
+            got = 0
+            for c in range(0, len(wanted), 400):  # keeps the select expression short
+                chunk = wanted[c:c + 400]
+                expr = "+".join(rf"eq(n\,{i})" for i in chunk)
+                for i, f in zip(chunk, self._ff.read(expr, None, self.rotate, limit=len(chunk))):
+                    got += 1
+                    yield i, f
+            if got:
+                return
+            log.warning("ffmpeg returned no frames; falling back to OpenCV")
         want = set(wanted)
         last = wanted[-1]
         cap = _open(self.path)

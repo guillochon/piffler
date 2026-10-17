@@ -12,7 +12,9 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 
-def write_pdf(path: str, pages) -> bool:
+def write_pdf(path: str, pages, dpi: float = 150.0) -> bool:
+    """One PDF page per book page, all the same size (the median page), with
+    the scan centred on it and an invisible, searchable text layer."""
     try:
         from reportlab.pdfgen import canvas
         from reportlab.lib.utils import ImageReader
@@ -20,39 +22,42 @@ def write_pdf(path: str, pages) -> bool:
     except ImportError:
         log.info("reportlab not installed; skipping PDF (pip install reportlab)")
         return False
-    c = None
+    items = []
     for p in pages:
-        img = cv2.imread(p.image_path)
+        img = cv2.imread(p.image_path, cv2.IMREAD_UNCHANGED) if p.image_path else None
         if img is None:
             continue
-        h, w = img.shape[:2]
-        dpi = 200.0
-        pw, ph = w * 72.0 / dpi, h * 72.0 / dpi
-        k = 72.0 / dpi
-        if c is None:
-            c = canvas.Canvas(path, pagesize=(pw, ph))
-        else:
-            c.setPageSize((pw, ph))
-        c.drawImage(ImageReader(p.image_path), 0, 0, pw, ph)
-        # invisible text layer so the PDF is searchable/selectable
+        sc = getattr(p, "image_scale", 1.0) or 1.0
+        items.append((p, img.shape[1] / sc, img.shape[0] / sc))  # size in OCR pixels
+    if not items:
+        return False
+    k = 72.0 / dpi  # points per OCR pixel
+    pw = float(np.median([w for _, w, _ in items])) * k
+    ph = float(np.median([h for _, _, h in items])) * k
+    c = canvas.Canvas(path, pagesize=(pw, ph))
+    c.setTitle(os.path.splitext(os.path.basename(path))[0])
+    for p, w, h in items:
+        f = min(pw / (w * k), ph / (h * k))  # fit, keeping the page's own shape
+        iw, ih = w * k * f, h * k * f
+        ox, oy = (pw - iw) / 2, (ph - ih) / 2
+        c.drawImage(ImageReader(p.image_path), ox, oy, iw, ih)
+        s = k * f  # points per OCR pixel on this page
         for wd in p.words:
             x0, x1 = wd.box[:, 0].min(), wd.box[:, 0].max()
             y0, y1 = wd.box[:, 1].min(), wd.box[:, 1].max()
-            fs = max(1.0, (y1 - y0) * k * 0.8)
+            fs = max(1.0, (y1 - y0) * s * 0.8)
             txt = wd.text.encode("latin-1", "replace").decode("latin-1")
             tw = stringWidth(txt, "Helvetica", fs) or 1.0
             t = c.beginText()
-            t.setTextRenderMode(3)
+            t.setTextRenderMode(3)  # invisible
             t.setFont("Helvetica", fs)
-            t.setHorizScale(100.0 * (x1 - x0) * k / tw)
-            t.setTextOrigin(x0 * k, ph - y1 * k + 0.2 * (y1 - y0) * k)
+            t.setHorizScale(100.0 * (x1 - x0) * s / tw)
+            t.setTextOrigin(ox + x0 * s, oy + ih - y1 * s + 0.2 * (y1 - y0) * s)
             t.textOut(txt)
             c.drawText(t)
         c.showPage()
-    if c is not None:
-        c.save()
-        return True
-    return False
+    c.save()
+    return True
 
 
 def write_outputs(out_dir: str, pages, meta: dict, make_pdf: bool = True) -> dict:

@@ -30,10 +30,26 @@ class Word:
         return float(self.box[:, 1].max() - self.box[:, 1].min())
 
 
+def gpu_params() -> dict:
+    """RapidOCR settings for the best onnxruntime GPU provider installed, if any."""
+    try:
+        import onnxruntime as ort
+        have = set(ort.get_available_providers())
+    except Exception:
+        return {}
+    for ep, key in (("CUDAExecutionProvider", "use_cuda"), ("DmlExecutionProvider", "use_dml"),
+                    ("CoreMLExecutionProvider", "use_coreml")):
+        if ep in have:
+            return {f"EngineConfig.onnxruntime.{key}": True}
+    return {}
+
+
 class OCREngine:
-    def __init__(self, long_side: int = 1600, min_score: float = 0.5):
+    def __init__(self, long_side: int = 1600, min_score: float = 0.5, gpu: bool = True):
         self.long_side = long_side
         self.min_score = min_score
+        self.gpu = gpu
+        self.device = "cpu"
         self._eng = None
         self._kind = None
 
@@ -42,7 +58,17 @@ class OCREngine:
             return
         try:
             from rapidocr import RapidOCR  # rapidocr >= 2
-            self._eng, self._kind = RapidOCR(), "v2"
+            params = gpu_params() if self.gpu else {}
+            try:
+                self._eng, self._kind = RapidOCR(params=params), "v2"
+                self._eng(np.full((64, 256, 3), 255, np.uint8))  # a GPU session can fail only on first use
+                self.device = next(iter(params), "cpu").rsplit(".use_", 1)[-1]
+            except Exception as e:
+                if not params:
+                    raise
+                log.warning("GPU OCR failed (%s); using the CPU", e)
+                self._eng, self._kind = RapidOCR(), "v2"
+            log.info("OCR device: %s", self.device)
         except ImportError:
             try:
                 from rapidocr_onnxruntime import RapidOCR  # legacy package

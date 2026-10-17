@@ -13,9 +13,10 @@ import numpy as np
 from .config import Config
 from .dewarp import dewarp, flatten_illumination, text_mask
 from .export import write_outputs
-from .hands import remove_fingers
+from .hands import align_to, remove_fingers, skin_mask
 from .ocr import OCREngine, Word, best_rotation, rotate, words_to_text
 from .page import detect_page, rectify, split_pages
+from .scan import clean_scan
 from .segment import FrameStats, Segment, analyze, find_segments
 from .video import VideoSource
 
@@ -32,7 +33,9 @@ class PageResult:
     segment: int
     frame_index: int
     time_s: float
-    image_path: str = ""
+    image_path: str = ""   # the clean scan (or the page photo with --no-scan)
+    photo_path: str = ""   # the flattened page photo
+    image_scale: float = 1.0  # image pixels per OCR-box pixel
     text: str = ""
     words: List[Word] = field(default_factory=list, repr=False)
     flags: List[str] = field(default_factory=list)
@@ -51,6 +54,7 @@ class PageResult:
             "page": self.page_no, "segment": self.segment, "frame_index": self.frame_index,
             "time_s": round(self.time_s, 2),
             "image": os.path.relpath(self.image_path, root) if root and self.image_path else self.image_path,
+            "photo": os.path.relpath(self.photo_path, root) if root and self.photo_path else self.photo_path,
             "chars": len(self.text), "ocr_mean_score": round(self.mean_score, 3),
             "flags": sorted(set(self.flags)), "needs_review": self.needs_review, "info": self.info,
         }
@@ -154,10 +158,76 @@ class _Deferred(Exception):
     """Page can't be located yet; retry once neighbouring pages give a prior."""
 
 
+def _text_zone(crop: np.ndarray, region: np.ndarray) -> np.ndarray:
+    """The page's text block: the box around its print, so a finger hiding
+    words still counts as covering text."""
+    tm = (text_mask(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)) > 0) & (region > 0)
+    zone = np.zeros(crop.shape[:2], np.uint8)
+    ys, xs = np.nonzero(tm)
+    if len(xs) < 50:
+        zone[region > 0] = 255
+        return zone
+    x0, x1 = np.percentile(xs, [1, 99]).astype(int)
+    y0, y1 = np.percentile(ys, [1, 99]).astype(int)
+    zone[y0:y1 + 1, x0:x1 + 1] = 255
+    return zone & region
+
+
+def _finger_cover(crop: np.ndarray, region: np.ndarray, zone: np.ndarray) -> float:
+    """Share of the text block hidden by hands in this frame (judged small)."""
+    s = min(1.0, 800.0 / max(crop.shape[:2]))
+    c = cv2.resize(crop, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+    r = cv2.resize(region, (c.shape[1], c.shape[0]), interpolation=cv2.INTER_NEAREST)
+    z = cv2.resize(zone, (c.shape[1], c.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
+    sk = skin_mask(c, r, pale=True) > 0
+    return float((sk & z).sum()) / max(1, int(z.sum()))
+
+
+def _consensus_cover(pool: Dict[int, np.ndarray], order: List[int], zone: np.ndarray) -> Dict[int, float]:
+    """Share of the text block where each frame disagrees with the others.
+
+    Skin colour alone misses a hand now and then (blur, glare, pale skin under
+    cool light), and that frame then looks finger-free. Aligned to each other,
+    the frames of one page agree except where something covers the page in only
+    some of them, so a per-pixel median shows what the page looks like and big
+    blobs that differ from it are hands, whatever their colour.
+    """
+    anchor = pool[order[0]]
+    s = min(1.0, 600.0 / max(anchor.shape[:2]))
+    small = {i: cv2.resize(pool[i], None, fx=s, fy=s, interpolation=cv2.INTER_AREA) for i in order}
+    a = small[order[0]]
+    h, w = a.shape[:2]
+    grays = {order[0]: cv2.cvtColor(a, cv2.COLOR_BGR2GRAY)}
+    for i in order[1:]:
+        H = align_to(a, small[i])
+        if H is not None:
+            grays[i] = cv2.warpPerspective(cv2.cvtColor(small[i], cv2.COLOR_BGR2GRAY), H, (w, h),
+                                           borderMode=cv2.BORDER_REPLICATE)
+    if len(grays) < 3:
+        return {}
+    z = cv2.resize(zone, (w, h), interpolation=cv2.INTER_NEAREST) > 0
+    if not z.any():
+        return {}
+    ids = list(grays)
+    stack = np.stack([cv2.GaussianBlur(grays[i], (5, 5), 0) for i in ids]).astype(np.float32)
+    stack *= (np.median(stack[:, z]) + 1) / (np.median(stack[:, z], axis=1) + 1)[:, None, None]  # exposure
+    med = np.median(stack, axis=0)
+    k = np.ones((5, 5), np.uint8)  # wider than a misaligned stroke edge, narrower than a finger
+    out = {}
+    for i, g in zip(ids, stack):
+        dev = cv2.morphologyEx(((np.abs(g - med) > 28) & z).astype(np.uint8), cv2.MORPH_OPEN, k)
+        out[i] = float(dev[z].mean())
+    return out
+
+
 def _process_segment(si: int, seg: Segment, frames: Dict[int, np.ndarray], cfg: Config,
                      engine: Optional[OCREngine], orient: _Orientation, fps: float,
                      out_pages: str, debug_dir: Optional[str], prior: _PagePrior,
-                     allow_defer: bool) -> List[PageResult]:
+                     allow_defer: bool, extra=None) -> List[PageResult]:
+    """`extra` is an earlier hold of the same page, (first frame index, frame ids
+    best-first, frames): its frames
+    join the pool, so the frame least covered by fingers can come from either
+    hold and the other hold's frames can fill in where fingers were."""
     cands = [i for i in seg.candidates if i in frames]
     if not cands:
         r = PageResult(0, si, seg.best, seg.t0, flags=seg.flags + ["frame_decode_failed"])
@@ -192,10 +262,22 @@ def _process_segment(si: int, seg: Segment, frames: Dict[int, np.ndarray], cfg: 
     else:
         prior.add(quad)
     flags += pflags
-    quad = quad * ds
+    holds = [(quad * ds, pmask, cands, frames)]  # (quad, page mask at det scale, frame ids, frames)
+    if extra is not None:
+        estart, eids, eframes = extra
+        ecands = [i for i in eids if i in eframes and i not in frames]
+        if ecands:
+            edet = _resize_long(eframes[ecands[0]], cfg.detect_long_side)
+            equad, emask, eflags = detect_page(edet, pmask)
+            if "page_by_brightness" in eflags:  # the book barely moved between holds
+                equad, emask = quad, pmask
+            holds.append((equad * ds, emask, ecands, eframes))
+            info["merged_hold"] = int(estart)
+            flags = [f for f in flags if f != "short_hold"]
     H, W = ref.shape[:2]
-    x0, y0 = quad.min(0)
-    x1, y1 = quad.max(0)
+    allq = np.concatenate([h[0] for h in holds])
+    x0, y0 = allq.min(0)
+    x1, y1 = allq.max(0)
     pad = 0.04 * max(x1 - x0, y1 - y0)
     x0, y0 = int(max(0, x0 - pad)), int(max(0, y0 - pad))
     x1, y1 = int(min(W, x1 + pad + 1)), int(min(H, y1 + pad + 1))
@@ -205,11 +287,45 @@ def _process_segment(si: int, seg: Segment, frames: Dict[int, np.ndarray], cfg: 
         f = f[y0:y1, x0:x1]
         return cv2.resize(f, None, fx=cs, fy=cs, interpolation=cv2.INTER_AREA) if cs < 1 else f
 
-    frames = {i: crop(frames[i]) for i in cands}
-    ref = frames[ref_idx]
-    quad = ((quad - [x0, y0]) * cs).astype(np.float32)
-    pmask = cv2.resize(cv2.resize(pmask, (W, H), interpolation=cv2.INTER_NEAREST)[y0:y1, x0:x1],
-                       (ref.shape[1], ref.shape[0]), interpolation=cv2.INTER_NEAREST)
+    pool, where = {}, {}  # cropped frames, and which hold each came from
+    for hi_, (_, _, ids, src_frames) in enumerate(holds):
+        for i in ids:
+            pool[i], where[i] = crop(src_frames[i]), hi_
+    crops = []
+    for q, m, _, _ in holds:
+        cq = ((q - [x0, y0]) * cs).astype(np.float32)
+        cm = cv2.resize(cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)[y0:y1, x0:x1],
+                        (pool[ref_idx].shape[1], pool[ref_idx].shape[0]), interpolation=cv2.INTER_NEAREST)
+        crops.append((cq, cm))
+    # reference = the frame whose text is least hidden by fingers; ties go to
+    # the sharpest (candidates come sharpest-first)
+    zones = [_text_zone(pool[h[2][0]], crops[k][1]) for k, h in enumerate(holds)]
+    order = [i for h in holds for i in h[2]]
+    cover = {i: _finger_cover(pool[i], crops[where[i]][1], zones[where[i]]) for i in order}
+    if len(order) >= 3:
+        agree = _consensus_cover(pool, order, zones[0])
+        for i in order:  # a frame that won't align with the rest can't be vouched for
+            cover[i] = max(cover[i], agree.get(i, cover[i] + 0.01)) if agree else cover[i]
+    ref_idx = min(order, key=lambda i: (round(cover[i], 3), order.index(i)))
+    info["finger_cover"] = round(cover[ref_idx], 4)
+    if debug_dir:  # every pooled frame with its hands (red), text block (green) and score
+        tiles = []
+        for i in order:
+            c, (_, m) = pool[i], crops[where[i]]
+            s_ = 400.0 / max(c.shape[:2])
+            cs_ = cv2.resize(c, None, fx=s_, fy=s_, interpolation=cv2.INTER_AREA)
+            ms_ = cv2.resize(m, (cs_.shape[1], cs_.shape[0]), interpolation=cv2.INTER_NEAREST)
+            sk_ = skin_mask(cs_, ms_, pale=True) > 0
+            cs_[sk_] = (0.4 * cs_[sk_] + [0, 0, 153]).astype(np.uint8)
+            z_ = cv2.resize(zones[where[i]], (cs_.shape[1], cs_.shape[0]), interpolation=cv2.INTER_NEAREST)
+            cv2.drawContours(cs_, cv2.findContours(z_, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0], -1, (0, 180, 0), 1)
+            cv2.putText(cs_, f"{i}{'*' if i == ref_idx else ''} {cover[i]:.3f}", (4, 16), 0, 0.5, (255, 0, 0), 1)
+            tiles.append(cs_)
+        hh = min(t.shape[0] for t in tiles)
+        cv2.imwrite(os.path.join(debug_dir, f"seg{si:04d}_pool.jpg"), np.hstack([t[:hh] for t in tiles]))
+    ref = pool[ref_idx]
+    quad, pmask = crops[where[ref_idx]]
+    frames, cands = pool, [ref_idx] + [i for i in order if i != ref_idx]
 
     clean = ref
     if cfg.remove_fingers:
@@ -271,6 +387,7 @@ def _process_segment(si: int, seg: Segment, frames: Dict[int, np.ndarray], cfg: 
         r._image = page
         if len(halves) > 1:
             r.info["half"] = "left" if hi == 0 else "right"
+            r.info["overlap_px"] = int(0.015 * region.shape[1])
         results.append(r)
     return results
 
@@ -307,11 +424,11 @@ def process_video(video_path: str, out_dir: str, cfg: Optional[Config] = None,
     st = os.stat(video_path) if os.path.exists(video_path) else None
     cache_path = os.path.join(out_dir, "analysis_cache.npz")
     cache_key = repr((os.path.abspath(video_path), st and st.st_size, st and int(st.st_mtime),
-                      cfg.analysis_fps, cfg.analysis_width, cfg.rotate))
+                      cfg.analysis_fps, cfg.analysis_width, cfg.rotate, "analysis-v2"))
 
-    with VideoSource(video_path, rotate=cfg.rotate, max_bad_reads=cfg.max_bad_reads) as src:
+    with VideoSource(video_path, rotate=cfg.rotate, max_bad_reads=cfg.max_bad_reads, use_gpu=cfg.gpu) as src:
         fps = src.info.fps
-        log.info("Video: %dx%d @ %.2f fps", src.info.width, src.info.height, fps)
+        log.info("Video: %dx%d @ %.2f fps, decoded with %s", src.info.width, src.info.height, fps, src.decoder)
         say("analyzing", 0.0)
         hint = max(1, src.info.frame_count_hint)
         stats = _load_stats(cache_path, cache_key)
@@ -327,7 +444,7 @@ def process_video(video_path: str, out_dir: str, cfg: Optional[Config] = None,
                        np.stack([stats.idx, stats.t, stats.motion, stats.sharp, stats.bright, stats.skin], 1),
                        delimiter=",", header="frame,t,motion,sharpness,brightness,skin", fmt="%.4f")
 
-        engine = OCREngine(cfg.lang_det_long_side, cfg.ocr_min_score) if cfg.ocr else None
+        engine = OCREngine(cfg.lang_det_long_side, cfg.ocr_min_score, cfg.gpu) if cfg.ocr else None
         orient = _Orientation(engine)
         # map frame -> segment, and the last frame each segment needs
         owner, last_needed = {}, {}
@@ -342,7 +459,9 @@ def process_video(video_path: str, out_dir: str, cfg: Optional[Config] = None,
         prior = _PagePrior()
         deferred: Dict[int, Dict[int, np.ndarray]] = {}
 
-        def finish(si, allow_defer=True):
+        def finish(si, allow_defer=True, repeats_only=False):
+            """Process segment `si`; returns False when `repeats_only` and it isn't
+            a repeat hold of the latest page (a new page past --max-pages)."""
             seg = segs[si]
             frames = buf.pop(si, None) or deferred.pop(si, None) or {}
             say("pages", (si + 1) / max(1, len(segs)))
@@ -356,26 +475,34 @@ def process_video(video_path: str, out_dir: str, cfg: Optional[Config] = None,
                 before = sorted((r for r in kept_refs if r[0] < si), key=lambda r: -r[0])[:3]
                 after = sorted((r for r in kept_refs if r[0] > si), key=lambda r: r[0])[:1]
                 for entry in after + before:
-                    psi, pthumb, pscore, pidx = entry
+                    psi, pthumb, pscore, pidx = entry[:4]
                     sim = page_similarity(thumb, pthumb)
                     log.debug("segment %d vs %d: sim %.3f", si, psi, sim)
                     if sim < cfg.dedupe_similarity:
                         continue
                     adjacent = any(entry is e for e in after) or (before and entry is before[0])
-                    if adjacent:  # same page held twice in a row: keep the better capture
+                    if adjacent and entry[5] is not None:
+                        # same page held twice in a row: pool both holds' frames, so the
+                        # frame least covered by fingers can come from either one
+                        replaces = entry
+                        log.info("segment %d repeats %d (sim %.2f); pooling their frames", si, psi, sim)
+                    elif adjacent:  # no frames kept for the other hold: keep the better capture
                         if max(seg.scores) <= pscore:
                             log.info("segment %d duplicates %d (sim %.2f); skipped", si, psi, sim)
-                            return
+                            return True
                         replaces = entry
                     else:
                         seg.flags.append("possible_duplicate")
                     break
+            if repeats_only and (replaces is None or replaces[5] is None):
+                return False
             try:
+                extra = (replaces[0], replaces[4], replaces[5]) if replaces is not None and replaces[5] else None
                 rs = _process_segment(si, seg, frames, cfg, engine, orient, fps, out_pages, debug_dir,
-                                      prior, allow_defer)
+                                      prior, allow_defer, extra)
             except _Deferred:
                 deferred[si] = frames
-                return
+                return True
             except Exception as e:  # never abort the whole book for one bad page
                 log.exception("segment %d failed", si)
                 rs = [PageResult(0, si, seg.best, seg.t0, flags=seg.flags + ["processing_error"],
@@ -391,24 +518,41 @@ def process_video(video_path: str, out_dir: str, cfg: Optional[Config] = None,
             for r in rs:
                 results.append(r); idxs.append(len(results) - 1)
             if thumb is not None:
-                kept_refs.append((si, thumb, max(seg.scores), idxs))
+                # keep this hold's frames (with any it pooled) for a repeat hold to
+                # join; only for the latest pages, to bound memory
+                ids = [i for i in seg.candidates if i in frames]
+                pooled = dict(frames)
+                if replaces is not None and replaces[5]:
+                    ids += [i for i in replaces[4] if i not in pooled]
+                    pooled.update(replaces[5])
+                ids = ids[:12]
+                pooled = {i: pooled[i] for i in ids}
+                kept_refs.append((si, thumb, max(seg.scores), idxs, ids, pooled))
+                latest = sorted(kept_refs, key=lambda e: -e[0])[:2]
+                kept_refs[:] = [e if e[5] is None or any(e is k for k in latest) else e[:5] + (None,)
+                                for e in kept_refs]
+            return True
 
         def enough():
             return cfg.max_pages > 0 and sum(r is not None for r in results) >= cfg.max_pages
 
         say("pages", 0.0)
+        full, stop = False, False
         for idx, frame in src.iter_fetch(owner.keys()):
             frame = _resize_long(frame, cfg.max_frame_side)
             for si in owner[idx]:
                 buf.setdefault(si, {})[idx] = frame
                 if idx >= last_needed[si] and si not in done:
                     done.add(si)
-                    finish(si)
+                    # past --max-pages, only repeat holds of the last page still help it
+                    stop = not finish(si, repeats_only=full) or stop
             if deferred and prior.quads and prior.gutters:
                 for si in sorted(deferred):
                     finish(si, allow_defer=False)
-            if enough():
-                log.info("Reached max_pages=%d; stopping early", cfg.max_pages)
+            if enough() and not full:
+                full = True
+                log.info("Reached max_pages=%d; finishing the last page's repeat holds", cfg.max_pages)
+            if stop:
                 break
         else:
             for si in range(len(segs)):  # segments whose last frame failed to decode
@@ -426,8 +570,19 @@ def process_video(video_path: str, out_dir: str, cfg: Optional[Config] = None,
         r.page_no = n
         img = getattr(r, "_image", None)
         if img is not None:
-            r.image_path = os.path.join(out_pages, f"page_{n:04d}.jpg")
-            cv2.imwrite(r.image_path, img, [cv2.IMWRITE_JPEG_QUALITY, cfg.jpeg_quality])
+            r.photo_path = os.path.join(out_pages, f"page_{n:04d}_photo.jpg")
+            cv2.imwrite(r.photo_path, img, [cv2.IMWRITE_JPEG_QUALITY, cfg.jpeg_quality])
+            r.image_path = r.photo_path
+            if cfg.scan:
+                try:
+                    r.image_path = os.path.join(out_pages, f"page_{n:04d}.png")
+                    side = {"left": "right", "right": "left"}.get(r.info.get("half"))  # binding side
+                    cv2.imwrite(r.image_path, clean_scan(img, upscale=cfg.scan_upscale, gutter=side,
+                                                           overlap=r.info.get("overlap_px", 0)))
+                    r.image_scale = cfg.scan_upscale
+                except Exception as e:  # the photo is still there
+                    log.warning("scan cleanup failed on page %d: %s", n, e)
+                    r.image_path = r.photo_path
             with open(os.path.join(out_pages, f"page_{n:04d}.txt"), "w", encoding="utf-8") as f:
                 f.write(r.text)
     meta = {"video": os.path.abspath(video_path), "fps": fps, "segments": len(segs),

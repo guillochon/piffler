@@ -26,12 +26,23 @@ def paper_color_lab(bgr: np.ndarray, region: Optional[np.ndarray] = None) -> np.
         return np.array([200, 128, 140], np.float32)
     L = lab[:, 0]
     sel = lab[L >= np.percentile(L, 60)]
+    if region is None and len(sel) > 50:
+        # a whole frame's bright pixels include cream pans and lamps; paper is
+        # among the least saturated of them
+        c = np.hypot(sel[:, 1] - 128, sel[:, 2] - 128)
+        sel = sel[c <= np.percentile(c, 70)]
     return np.median(sel, axis=0)
 
 
 def skin_mask(bgr: np.ndarray, region: Optional[np.ndarray] = None, paper_delta: float = 14.0,
-              min_area_frac: float = 0.0015, require_edge: bool = True) -> np.ndarray:
-    """Return uint8 mask (255 = probable hand/finger)."""
+              min_area_frac: float = 0.0015, require_edge: bool = True, pale: bool = False) -> np.ndarray:
+    """Return uint8 mask (255 = probable hand/finger).
+
+    ``pale`` also finds washed-out skin (bright or cool light) that the colour
+    tests alone miss. Its colour overlaps aged paper, so a pale blob only counts
+    when a little of it (8%) lies outside the page (``region``) or, without a region, the frame
+    edge: a hand on a page is attached to an arm that isn't on the page.
+    """
     h, w = bgr.shape[:2]
     ycc = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
@@ -51,11 +62,32 @@ def skin_mask(bgr: np.ndarray, region: Optional[np.ndarray] = None, paper_delta:
     # skin sits at Lab hue ~35-60 deg with clear redness; aged paper is ~65-90 deg (yellow)
     skinlike = (a_ >= 9) & (hue > 20) & (hue < 62) & ((lab[..., 1] - paper[1]) > 6)
     m &= (d > paper_delta) & skinlike
-
-    mask = m.astype(np.uint8) * 255
     k = max(3, int(round(min(h, w) * 0.006)) | 1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3 * k, 3 * k)))
+
+    def tidy(mm):
+        mm = cv2.morphologyEx(mm.astype(np.uint8) * 255, cv2.MORPH_OPEN,
+                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+        return cv2.morphologyEx(mm, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3 * k, 3 * k)))
+
+    mask = tidy(m)
+    if pale:
+        # pale skin (a* 3-10, low saturation) fails the tests above, but against
+        # this page's own paper it is still clearly redder and more saturated
+        pa, pb = paper[1] - 128.0, paper[2] - 128.0
+        chroma, pchroma = np.hypot(a_, b_), float(np.hypot(pa, pb))
+        pm = tidy(((a_ - pa) >= 2.0) & ((chroma - pchroma) >= 3.5) & (hue > 15) & (hue < 85)
+                  & (lab[..., 0] > 0.45 * paper[0]) & (d > 0.6 * paper_delta)) | mask
+        n, lbl, st, _ = cv2.connectedComponentsWithStats(pm, 8)
+        if n > 1:
+            if region is not None:
+                inside = np.bincount(lbl[region > 0].ravel(), minlength=n)
+                ok = (st[:, 4] - inside) >= 0.08 * st[:, 4]
+            else:
+                e = max(2, int(0.01 * min(h, w)))
+                x, y, bw, bh = st[:, 0], st[:, 1], st[:, 2], st[:, 3]
+                ok = (x <= e) | (y <= e) | (x + bw >= w - e) | (y + bh >= h - e)
+            ok[0] = False
+            mask = np.maximum(mask, ok[lbl].astype(np.uint8) * 255)
 
     n, lbl, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
     keep = np.zeros(n, bool)
@@ -80,7 +112,7 @@ def skin_mask(bgr: np.ndarray, region: Optional[np.ndarray] = None, paper_delta:
 
 def skin_fraction(bgr_small: np.ndarray) -> float:
     try:
-        return float((skin_mask(bgr_small) > 0).mean())
+        return float((skin_mask(bgr_small, pale=True) > 0).mean())
     except Exception:
         return 0.0
 
@@ -138,7 +170,7 @@ def remove_fingers(ref: np.ndarray, others: List[np.ndarray], region: Optional[n
     that residual overlaps text, the caller should flag the page.
     """
     stats = {"finger_px_frac": 0.0, "filled_from_frames": 0.0, "residual_frac": 0.0, "aligned": 0}
-    mask = skin_mask(ref, region, paper_delta)
+    mask = skin_mask(ref, region, paper_delta, pale=True)
     if region is not None:
         mask_in = cv2.bitwise_and(mask, region)
     else:
@@ -157,14 +189,27 @@ def remove_fingers(ref: np.ndarray, others: List[np.ndarray], region: Optional[n
     for o in others:
         if o is None or o.shape != ref.shape:
             continue
-        omask = skin_mask(o, None, paper_delta)
+        omask = skin_mask(o, None, paper_delta, pale=True)
         H = align_to(ref, o, need, omask)
         if H is None:
             continue
         warped = cv2.warpPerspective(o, H, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
         okm = cv2.warpPerspective(cv2.bitwise_not(cv2.dilate(omask, np.ones((2 * pad + 1,) * 2, np.uint8))),
                                   H, (w, h), flags=cv2.INTER_NEAREST, borderValue=0)
-        # also require photometric agreement outside the hand to guard against bad alignment
+        # require the donor to agree with the reference just around the hand: a
+        # frame that aligned badly (the book shifted, the page flexed) would paste
+        # smeared print into the hole
+        ring = (cv2.dilate(need, np.ones((31, 31), np.uint8)) > 0) & (need == 0) & (okm > 0) & (mask == 0)
+        if ring.sum() > 200:
+            gr = cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            gw = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            gw *= (gr[ring].mean() + 1) / (gw[ring].mean() + 1)  # exposure drift
+            # compare print, not paper: the error over the darker (inked) ring pixels
+            inked = ring & (gr < np.percentile(gr[ring], 30))
+            err = float(np.median(np.abs(gr[inked] - gw[inked]))) if inked.sum() > 50 else 0.0
+            if err > 18:
+                stats["rejected"] = stats.get("rejected", 0) + 1
+                continue
         stack.append(warped)
         valid.append(okm > 0)
         stats["aligned"] += 1
