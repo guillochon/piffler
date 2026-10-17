@@ -17,6 +17,7 @@ def main(argv=None):
     ap.add_argument("--rotate", type=int, default=0, choices=[0, 90, 180, 270],
                     help="force rotation if the video is sideways (default: auto-detect)")
     ap.add_argument("--min-hold", type=float, default=0.35, help="seconds a page must be still")
+    ap.add_argument("--max-pages", type=int, default=0, help="stop after N pages (default: all)")
     ap.add_argument("--no-ocr", action="store_true")
     ap.add_argument("--no-dewarp", action="store_true")
     ap.add_argument("--no-fingers", action="store_true", help="don't attempt finger removal")
@@ -29,7 +30,7 @@ def main(argv=None):
                         format="%(levelname)s %(name)s: %(message)s")
     cfg = Config(layout=a.layout, rotate=a.rotate, min_hold_s=a.min_hold, ocr=not a.no_ocr,
                  dewarp=not a.no_dewarp, remove_fingers=not a.no_fingers, dedupe=not a.no_dedupe,
-                 pdf=not a.no_pdf, save_debug=a.debug)
+                 pdf=not a.no_pdf, save_debug=a.debug, max_pages=a.max_pages)
     from .pipeline import process_video
     from .video import VideoError
     last = [None]

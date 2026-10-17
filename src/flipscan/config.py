@@ -20,7 +20,9 @@ class Config:
 
     # --- page geometry ----------------------------------------------------
     layout: str = "auto"              # "auto" | "single" | "spread" (two pages per frame)
-    work_long_side: int = 2400        # full-res frames are downscaled to this before processing
+    detect_long_side: int = 2400      # page detection runs on frames downscaled to this
+    work_long_side: int = 2400        # the cropped page region is downscaled to at most this
+    max_frame_side: int = 4096        # decoded frames larger than this are downscaled on arrival
     dewarp: bool = True
 
     # --- fingers ---------------------------------------------------------
@@ -36,6 +38,7 @@ class Config:
     save_debug: bool = False
     pdf: bool = True
     jpeg_quality: int = 92
+    max_pages: int = 0                # stop after this many pages (0 = whole book)
 
     extra: dict = field(default_factory=dict)
 

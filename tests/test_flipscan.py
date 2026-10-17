@@ -20,6 +20,7 @@ from flipscan import Config  # noqa: E402
 from flipscan.dewarp import dewarp, find_lines, text_mask  # noqa: E402
 from flipscan.hands import skin_mask  # noqa: E402
 from flipscan.ocr import Word, reading_order, words_to_text  # noqa: E402
+from flipscan.page import detect_page, split_pages  # noqa: E402
 from flipscan.pipeline import process_video  # noqa: E402
 from flipscan.video import VideoError, VideoSource  # noqa: E402
 
@@ -63,6 +64,57 @@ def _page_frames(n_pages=2, hold=1.2, flip=0.4, fps=30, rot=None):
     if rot is not None:
         frames = [cv2.rotate(f, rot) for f in frames]
     return frames, truths
+
+
+# ------------------------------------------------- real-kitchen-style scenes
+
+def _cluttered_scene():
+    """A small book page on speckled stone next to a big, bright, text-free pan."""
+    rng = np.random.default_rng(3)
+    h, w = 1920, 1080
+    scene = np.clip(rng.normal(140, 35, (h, w, 1)), 0, 255).astype(np.uint8).repeat(3, 2)
+    scene = cv2.GaussianBlur(scene, (3, 3), 0)
+    cv2.circle(scene, (330, 420), 300, (238, 240, 236), -1)  # white enamel pan, brighter than the page
+    page, _ = mtv.render_page(*mtv.TEXTS[1], 7)
+    page = cv2.resize(page, (420, 600))
+    scene[1150:1750, 450:870] = page
+    return scene, (450, 1150, 870, 1750)
+
+
+def test_page_found_by_text_not_by_brightness():
+    scene, (x0, y0, x1, y1) = _cluttered_scene()
+    quad, _, flags = detect_page(scene)
+    assert "page_by_brightness" not in flags
+    cx, cy = quad.mean(0)
+    assert x0 < cx < x1 and y0 < cy < y1
+
+
+def test_blank_spread_split_at_learned_gutter():
+    spread = np.full((700, 800, 3), 235, np.uint8)  # two blank pages: no gutter to see
+    halves, flags, sure = split_pages(spread, "auto", hint=0.45)
+    assert len(halves) == 2 and sure is None
+    assert abs(halves[0].shape[1] - 0.45 * 800) < 0.03 * 800
+
+
+def test_max_pages_stops_early(tmp_path):
+    frames, _ = _page_frames(3)
+    p = _write(str(tmp_path / "v.mp4"), frames)
+    pages = process_video(p, str(tmp_path / "out"), Config(ocr=False, pdf=False, max_pages=1))
+    assert len(pages) == 1
+
+
+def test_analysis_is_reused(tmp_path, monkeypatch):
+    frames, _ = _page_frames(2)
+    p = _write(str(tmp_path / "v.mp4"), frames)
+    out = str(tmp_path / "out")
+    first = process_video(p, out, Config(ocr=False, pdf=False))
+    import flipscan.pipeline as pl
+
+    def boom(*a, **k):
+        raise AssertionError("analysis should come from the cache")
+    monkeypatch.setattr(pl, "analyze", boom)
+    again = process_video(p, out, Config(ocr=False, pdf=False))
+    assert len(again) == len(first)
 
 
 # ---------------------------------------------------------------- bad files

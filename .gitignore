@@ -8,3 +8,4 @@ dist/
 *.mp4
 *.truth.json
 flipscan_out/
+scans/
