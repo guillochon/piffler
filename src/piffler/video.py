@@ -57,7 +57,7 @@ def _transcode(path: str) -> Optional[str]:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         return None
-    fd, out = tempfile.mkstemp(suffix=".mp4", prefix="flipscan_")
+    fd, out = tempfile.mkstemp(suffix=".mp4", prefix="piffler_")
     os.close(fd)
     cmd = [ffmpeg, "-v", "error", "-y", "-err_detect", "ignore_err", "-i", path,
            "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p", out]

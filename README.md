@@ -1,10 +1,10 @@
-# flipscan
+# Piffler the Page Riffler
 
 Turn a phone video of you flipping through a book into clean page scans, plain text, and a searchable PDF. The book stays intact: no flatbed, no pressing the spine.
 
 ```
 pip install -e ".[pdf]"
-flipscan my_book.mp4 -o my_book/
+piffler my_book.mp4 -o my_book/
 ```
 
 Output:
@@ -47,7 +47,7 @@ Review flags include `finger_may_cover_text`, `short_hold`, `low_quality_frame`,
 ## Python API
 
 ```python
-from flipscan import Config, process_video
+from piffler import Config, process_video
 
 pages = process_video("book.mp4", "out/", Config(layout="spread", min_hold_s=0.5))
 for p in pages:

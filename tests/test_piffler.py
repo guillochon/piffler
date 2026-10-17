@@ -16,13 +16,13 @@ HERE = os.path.dirname(__file__)
 sys.path.insert(0, HERE)
 import make_test_video as mtv  # noqa: E402
 
-from flipscan import Config  # noqa: E402
-from flipscan.dewarp import dewarp, find_lines, text_mask  # noqa: E402
-from flipscan.hands import skin_mask  # noqa: E402
-from flipscan.ocr import Word, reading_order, words_to_text  # noqa: E402
-from flipscan.page import detect_page, split_pages  # noqa: E402
-from flipscan.pipeline import process_video  # noqa: E402
-from flipscan.video import VideoError, VideoSource  # noqa: E402
+from piffler import Config  # noqa: E402
+from piffler.dewarp import dewarp, find_lines, text_mask  # noqa: E402
+from piffler.hands import skin_mask  # noqa: E402
+from piffler.ocr import Word, reading_order, words_to_text  # noqa: E402
+from piffler.page import detect_page, split_pages  # noqa: E402
+from piffler.pipeline import process_video  # noqa: E402
+from piffler.video import VideoError, VideoSource  # noqa: E402
 
 DATA = os.path.join(HERE, "data")
 
@@ -108,7 +108,7 @@ def test_analysis_is_reused(tmp_path, monkeypatch):
     p = _write(str(tmp_path / "v.mp4"), frames)
     out = str(tmp_path / "out")
     first = process_video(p, out, Config(ocr=False, pdf=False))
-    import flipscan.pipeline as pl
+    import piffler.pipeline as pl
 
     def boom(*a, **k):
         raise AssertionError("analysis should come from the cache")

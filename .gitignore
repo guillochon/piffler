@@ -7,5 +7,5 @@ dist/
 .pytest_cache/
 *.mp4
 *.truth.json
-flipscan_out/
+piffler_out/
 scans/

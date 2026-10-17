@@ -8,10 +8,10 @@ from .config import Config
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="flipscan",
+    ap = argparse.ArgumentParser(prog="piffler",
                                  description="Turn a page-flipping video into page scans + OCR text.")
     ap.add_argument("video")
-    ap.add_argument("-o", "--out", default="flipscan_out", help="output directory")
+    ap.add_argument("-o", "--out", default="piffler_out", help="output directory")
     ap.add_argument("--layout", choices=["auto", "single", "spread"], default="auto",
                     help="one page per frame, two-page spreads, or detect")
     ap.add_argument("--rotate", type=int, default=0, choices=[0, 90, 180, 270],

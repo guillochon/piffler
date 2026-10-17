@@ -3,7 +3,7 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "flipscan"
+name = "piffler"
 version = "0.1.0"
 description = "Turn a video of someone flipping through a book into clean, dewarped, OCR'd page scans."
 readme = "README.md"
@@ -20,7 +20,7 @@ pdf = ["reportlab>=3.6"]
 test = ["pytest>=7"]
 
 [project.scripts]
-flipscan = "flipscan.cli:main"
+piffler = "piffler.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
