@@ -65,3 +65,7 @@ version = {attr = "piffler.__version__"}
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["piffler*"]
+
+[tool.setuptools.package-data]
+# the agent skill (instructions for AI coding agents), installed with `piffler skill install`
+piffler = ["skill/*.md", "skill/reference/*.md", "skill/scripts/*.py"]

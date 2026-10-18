@@ -1,5 +1,6 @@
 include LICENSE README.md CHANGELOG.md
 graft tests
+graft src/piffler/skill
 global-exclude __pycache__ *.py[cod] *.mp4 *.truth.json
 prune scans
 prune piffler_out

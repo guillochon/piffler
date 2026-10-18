@@ -29,3 +29,7 @@ First public release.
   `overrides.json` and applied by every later run.
 - Each page gets a stable id (`s142-left`) and a sidecar file with its words and the context
   it was made from.
+- An agent skill for AI coding agents, bundled in the package (`piffler skill install`):
+  workflow, suggested settings by kind of video and by symptom, a recovery playbook, and a
+  review script that checks page order and makes contact sheets.
+- `--config KEY=VALUE` sets any processing setting from the command line.

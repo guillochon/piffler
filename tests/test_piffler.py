@@ -231,6 +231,28 @@ def test_fix_redoes_only_chosen_pages(tmp_path, monkeypatch):
     assert rep["pages"] == 2
 
 
+def test_agent_skill_is_bundled_and_installs(tmp_path):
+    from piffler.cli import main, skill_dir
+    d = skill_dir()
+    text = open(os.path.join(d, "SKILL.md"), encoding="utf-8").read()
+    head = text.split("---")[1]
+    assert "name: piffler" in head and "description:" in head
+    for rel in ("reference/tuning.md", "reference/recovery.md", "scripts/review_book.py"):
+        assert os.path.exists(os.path.join(d, rel)), rel
+        assert rel in text or rel.startswith("scripts")  # SKILL.md points at its references
+    assert main(["skill", "install", "--dest", str(tmp_path)]) == 0
+    assert os.path.exists(tmp_path / "piffler" / "SKILL.md")
+    assert main(["skill", "install", "--dest", str(tmp_path)]) == 2  # won't overwrite without --force
+
+
+def test_config_option_sets_any_field():
+    from piffler.cli import main
+    with pytest.raises(SystemExit):
+        main(["x.mp4", "--config", "no_such_field=1"])
+    with pytest.raises(SystemExit):
+        main(["x.mp4", "--config", "motion_k=lots"])
+
+
 def test_blank_spread_split_at_learned_gutter():
     spread = np.full((700, 800, 3), 235, np.uint8)  # two blank pages: no gutter to see
     halves, flags, sure = split_pages(spread, "auto", hint=0.45)

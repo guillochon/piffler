@@ -78,10 +78,55 @@ def fix_main(argv) -> int:
     return 0
 
 
+def skill_dir() -> str:
+    """Where the bundled agent skill lives inside the installed package."""
+    import os
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "skill")
+
+
+def skill_main(argv) -> int:
+    import os
+    import shutil
+    ap = argparse.ArgumentParser(
+        prog="piffler skill",
+        description="The piffler agent skill: instructions and suggested settings for AI coding agents "
+                    "(Claude Code and other tools that read SKILL.md skills).")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    ins = sub.add_parser("install", help="copy the skill where agents find it")
+    where = ins.add_mutually_exclusive_group()
+    where.add_argument("--project", action="store_true",
+                       help="into ./.claude/skills/piffler (this project only) instead of your user folder")
+    where.add_argument("--dest", help="into this folder instead (the skill goes in DEST/piffler)")
+    ins.add_argument("--force", action="store_true", help="replace an existing copy")
+    sub.add_parser("path", help="print where the bundled skill is")
+    a = ap.parse_args(argv)
+    src = skill_dir()
+    if a.cmd == "path":
+        print(src)
+        return 0
+    if a.dest:
+        base = a.dest
+    elif a.project:
+        base = os.path.join(os.getcwd(), ".claude", "skills")
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".claude", "skills")
+    dst = os.path.join(base, "piffler")
+    if os.path.exists(dst):
+        if not a.force:
+            print(f"error: {dst} already exists (use --force to replace it)", file=sys.stderr)
+            return 2
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    print(f"installed the piffler skill in {dst}")
+    return 0
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] == "fix":
         return fix_main(argv[1:])
+    if argv and argv[0] == "skill":
+        return skill_main(argv[1:])
     ap = argparse.ArgumentParser(prog="piffler",
                                  description="Turn a page-flipping video into page scans + OCR text.")
     ap.add_argument("video")
@@ -101,6 +146,9 @@ def main(argv=None):
     ap.add_argument("--no-scan", action="store_true", help="use the page photos instead of clean scans")
     ap.add_argument("--scan-style", choices=["natural", "bw"], default="natural",
                     help="natural: the page's own paper tone and soft text; bw: crisp black on white")
+    ap.add_argument("--config", action="append", default=[], metavar="KEY=VALUE",
+                    help="set any Config field, e.g. --config motion_k=0.35 --config candidates_per_page=8 "
+                         "(see the piffler skill's tuning reference)")
     ap.add_argument("--debug", action="store_true", help="save intermediate images and stats")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
@@ -109,6 +157,19 @@ def main(argv=None):
     cfg = Config(layout=a.layout, rotate=a.rotate, min_hold_s=a.min_hold, ocr=not a.no_ocr,
                  dewarp=not a.no_dewarp, remove_fingers=not a.no_fingers, dedupe=not a.no_dedupe,
                  pdf=not a.no_pdf, save_debug=a.debug, max_pages=a.max_pages, gpu=not a.cpu, scan=not a.no_scan, scan_style=a.scan_style)
+    for kv in a.config:
+        if "=" not in kv:
+            ap.error(f"--config needs KEY=VALUE, got {kv!r}")
+        k, v = (x.strip() for x in kv.split("=", 1))
+        if k not in Config.__dataclass_fields__ or k == "extra":
+            ap.error(f"unknown config field {k!r}; fields: {', '.join(f for f in Config.__dataclass_fields__ if f != 'extra')}")
+        cur = getattr(cfg, k)
+        val = _value(v)
+        if isinstance(cur, bool) and not isinstance(val, bool):
+            ap.error(f"{k} takes true or false")
+        if isinstance(cur, (int, float)) and not isinstance(cur, bool) and not isinstance(val, (int, float)):
+            ap.error(f"{k} takes a number")
+        setattr(cfg, k, type(cur)(val) if isinstance(cur, (int, float)) and not isinstance(cur, bool) else val)
     from .pipeline import process_video
     from .video import VideoError
     last = [None]
