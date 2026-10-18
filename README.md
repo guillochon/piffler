@@ -2,18 +2,37 @@
 
 Turn a phone video of you flipping through a book into clean page scans, plain text, and a searchable PDF. The book stays intact: no flatbed, no pressing the spine.
 
+## Installation
+
+Piffler is on PyPI and needs Python 3.9 or newer:
+
 ```
 pip install piffler
-piffler my_book.mp4 -o my_book/
 ```
 
-ffmpeg on your PATH is recommended (faster, GPU-accelerated decoding); without it, OpenCV decodes the video.
+This installs the `piffler` command and everything it needs, including OCR and PDF export. A virtual environment keeps its dependencies (OpenCV, ONNX Runtime) separate from your other projects:
+
+```
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install piffler
+```
+
+Also recommended: [ffmpeg](https://ffmpeg.org/download.html) on your PATH, for faster, GPU-accelerated video decoding. Without it, piffler decodes the video with OpenCV. On Windows, OCR runs on the GPU out of the box; on Linux with an NVIDIA GPU, see [GPU](#gpu).
+
+To upgrade later: `pip install --upgrade piffler`.
+
+## Quick start
+
+```
+piffler my_book.mp4 -o my_book/
+```
 
 Output:
 
 ```
 my_book/
-  pages/page_0001.png        clean scan: flattened, finger-free, white paper, dark text
+  pages/page_0001.jpg        clean scan: flattened, finger-free, even paper, dark text
   pages/page_0001_photo.jpg  the same page as a colour photo, before clean-up
   pages/page_0001.txt        OCR text for that page
   book.txt                   all text, in page order
@@ -99,10 +118,6 @@ python tests/make_test_video.py demo.mp4   # make the test video yourself
 ```
 
 The test video mixes real photos of curved, yellowed book pages (from the MIT-licensed [page-dewarp](https://github.com/lmmx/page-dewarp) examples) with rendered pages of known text. It simulates handheld shake, exposure drift, page-turn motion, fingers, a too-short hold, a mid-page hesitation, a dark page, a two-page spread, and a corrupted file tail. On it, every page is found once, and OCR matches ground truth at 100% character similarity on all unobstructed pages.
-
-## Releasing
-
-CI (`.github/workflows/ci.yml`) runs the tests on Linux (Python 3.9-3.13), Windows and macOS, the end-to-end test, and a package build on every push and pull request. Publishing a GitHub release tagged `vX.Y.Z` (matching `piffler.__version__`) uploads to PyPI through `.github/workflows/publish.yml`; running that workflow by hand uploads to TestPyPI instead. It uses PyPI Trusted Publishing, which needs a one-time setup: on PyPI (and TestPyPI), add a pending publisher for project `piffler`, owner `guillochon`, repository `piffler`, workflow `publish.yml`, environment `pypi` (`testpypi` on TestPyPI).
 
 ## Known limitations
 
