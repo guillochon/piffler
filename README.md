@@ -2,6 +2,8 @@
 
 Turn a phone video of you flipping through a book into clean page scans, plain text, and a searchable PDF. The book stays intact: no flatbed, no pressing the spine.
 
+![Piffler riffling through a book](https://github.com/guillochon/piffler/blob/main/docs/piffler.gif?raw=true)
+
 ## Installation
 
 Piffler is on PyPI and needs Python 3.9 or newer:
@@ -42,6 +44,19 @@ my_book/
 ```
 
 Useful options: `--max-pages N` to try the first few pages, `--cpu` to stay off the GPU, `--no-scan` to put the photos in the PDF instead of clean scans.
+
+## Using piffler with an AI agent
+
+piffler ships with an agent skill: instructions for AI coding agents (Claude Code, and other tools that read `SKILL.md` skills) on running it, reviewing the output, choosing settings for a particular video, and repairing pages. Install it where your agent looks:
+
+```
+piffler skill install            # into ~/.claude/skills/piffler
+piffler skill install --project  # into ./.claude/skills/piffler, for this project only
+```
+
+Then ask the agent to digitize a video. Its tuning reference (suggested values by kind of video, and what to change for each symptom) is useful on its own too: `piffler skill path` shows where it is.
+
+Any setting can be changed on the command line with `--config KEY=VALUE`, for example `--config motion_k=0.4` for a hand-held video.
 
 ## Fixing pages
 
