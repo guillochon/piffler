@@ -176,6 +176,30 @@ def test_facing_page_strip_is_dropped():
     assert _drop_facing_column(page(left_page=True), 600, gutter_right=True)[1] is None
 
 
+def test_repeated_pages_are_dropped():
+    from types import SimpleNamespace as NS
+    from piffler.repeats import drop_repeats
+
+    def text(seed):
+        rng = np.random.default_rng(seed)
+        words = ["golf", "drouot", "henri", "colette", "musique", "soir", "groupe", "scene", "public",
+                 "guitare", "disque", "radio", "concert", "bar", "rock", "salle", "jeunes", "paris"]
+        return " ".join(rng.choice(words, 80))
+
+    def pg(seg, half, frame, txt, flags=()):
+        return NS(segment=seg, info={"half": half}, frame_index=frame, time_s=frame / 30, text=txt,
+                  flags=list(flags), mean_score=0.95)
+
+    pages = [pg(1, "left", 10, text(1)), pg(1, "right", 10, text(2)),
+             pg(2, "left", 50, text(3)), pg(2, "right", 50, text(4)),
+             # the reader lifts the right page: same left page again, countertop on the right
+             pg(3, "left", 70, text(3)[:300], ["page_from_neighbors"]), pg(3, "right", 70, "", ["page_from_neighbors"]),
+             pg(4, "left", 90, text(5)), pg(4, "right", 90, "")]  # a genuinely blank page
+    kept, dropped = drop_repeats(pages)
+    assert [p.segment for p in kept] == [1, 1, 2, 2, 4, 4]
+    assert len(dropped) == 2
+
+
 def test_blank_spread_split_at_learned_gutter():
     spread = np.full((700, 800, 3), 235, np.uint8)  # two blank pages: no gutter to see
     halves, flags, sure = split_pages(spread, "auto", hint=0.45)

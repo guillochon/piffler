@@ -11,20 +11,24 @@ import cv2
 import numpy as np
 
 from .config import Config
-from .dewarp import deshear, dewarp, flatten_illumination, text_mask
+from .dewarp import deshear, dewarp, find_lines, flatten_illumination, text_mask
 from .export import write_outputs
 from .hands import align_to, occluder_mask, remove_fingers, skin_mask
 from .ocr import OCREngine, Word, best_rotation, rotate, words_to_text
 from .page import detect_page, rectify, split_pages
+from .repeats import drop_repeats
 from .scan import clean_scan
 from .segment import FrameStats, Segment, analyze, find_segments
 from .video import VideoSource
 
 log = logging.getLogger(__name__)
 
-REVIEW_FLAGS = {"finger_may_cover_text", "low_quality_frame", "short_hold", "page_not_found",
-                "processing_error", "gutter_guessed", "no_text_found", "no_still_segments",
-                "possible_duplicate", "low_ocr_confidence"}
+# flags that mean "look at this page": something may be missing or wrong on it.
+# Informational flags (no_text_found on a blank page, short_hold, gutter_from_neighbors)
+# describe how a page was made and are not reasons to re-shoot it.
+REVIEW_FLAGS = {"finger_may_cover_text", "low_quality_frame", "page_not_found", "page_from_neighbors",
+                "processing_error", "gutter_guessed", "no_still_segments", "frame_decode_failed",
+                "possible_duplicate", "low_ocr_confidence", "dewarp_failed"}
 
 
 @dataclass
@@ -180,6 +184,39 @@ def _text_zone(crop: np.ndarray, region: np.ndarray) -> np.ndarray:
     y0, y1 = np.percentile(ys, [1, 99]).astype(int)
     zone[y0:y1 + 1, x0:x1 + 1] = 255
     return zone & region
+
+
+def _column_zone(img: np.ndarray, region: np.ndarray) -> np.ndarray:
+    """Where text runs: each text column's box, from its detected lines (left
+    and right edges = typical line start and end; top and bottom = first and
+    last line, half a line pitch out). Margins, page edges and blank pages are
+    outside it. A spread gives two columns."""
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    s = min(1.0, 1400.0 / g.shape[0])
+    gs = cv2.resize(g, None, fx=s, fy=s, interpolation=cv2.INTER_AREA) if s < 1 else g
+    zone = np.zeros(gs.shape, np.uint8)
+    lines = find_lines(text_mask(gs))
+    if len(lines) >= 3:
+        spans = np.array([(l[:, 0].min(), l[:, 0].max(), float(np.median(l[:, 1]))) for l in lines], np.float32)
+        cx = (spans[:, 0] + spans[:, 1]) / 2
+        cols = [spans]
+        order = np.sort(cx)
+        if len(order) >= 6:  # two columns if line centres split around a wide gap
+            gaps = np.diff(order)
+            k = int(np.argmax(gaps))
+            if gaps[k] > 0.15 * gs.shape[1]:
+                cut = (order[k] + order[k + 1]) / 2
+                cols = [spans[cx < cut], spans[cx >= cut]]
+        for c in cols:
+            if len(c) < 3:
+                continue
+            ys = np.sort(c[:, 2])
+            pitch = float(np.median(np.diff(ys))) if len(ys) > 1 else 20.0
+            x0, x1 = np.median(c[:, 0]), np.median(c[:, 1])
+            y0, y1 = ys[0] - 0.5 * pitch, ys[-1] + 0.5 * pitch
+            zone[int(max(0, y0)):int(y1) + 1, int(max(0, x0)):int(x1) + 1] = 255
+    zone = cv2.resize(zone, (g.shape[1], g.shape[0]), interpolation=cv2.INTER_NEAREST)
+    return cv2.bitwise_and(zone, region)
 
 
 def _finger_cover(crop: np.ndarray, region: np.ndarray, zone: np.ndarray) -> float:
@@ -346,12 +383,13 @@ def _process_segment(si: int, seg: Segment, frames: Dict[int, np.ndarray], cfg: 
         fstats["occluder_frac"] = float((occ > 0).sum()) / max(1, int((pmask > 0).sum()))
         info["fingers"] = {k: round(v, 4) if isinstance(v, float) else v for k, v in fstats.items()}
         if residual.any():
-            g = cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY)
-            tm = text_mask(g)
-            kn = max(9, int(0.02 * max(ref.shape[:2])) | 1)
-            near = cv2.dilate(residual, np.ones((kn, kn), np.uint8))
-            cov = (tm > 0) & (near > 0) & (pmask > 0)
-            if cov.sum() > 0.0005 * pmask.astype(bool).sum() and fstats["residual_frac"] > 0.002:
+            # only skin no other frame could fill gets painted with paper; it hides
+            # text only where it lies inside the text block (margins don't matter)
+            zone = _column_zone(clean, pmask) > 0
+            cov = (residual > 0) & zone
+            zone_px = max(1, int(zone.sum()))
+            info["hidden_text_frac"] = round(float(cov.sum()) / zone_px, 4) if zone.any() else 0.0
+            if cov.sum() > 0.002 * zone_px:
                 ys, xs = np.nonzero(cov)
                 covered_pts = np.float32(np.stack([xs, ys], 1))  # assigned to a page after the split
         if debug_dir:
@@ -388,7 +426,7 @@ def _process_segment(si: int, seg: Segment, frames: Dict[int, np.ndarray], cfg: 
             else:  # only the page the hidden text is on
                 gx = halves[0].shape[1] - int(0.015 * region.shape[1])  # the split line
                 n_here = int((covered_x < gx).sum() if hi == 0 else (covered_x >= gx).sum())
-                if n_here > 0.00025 * pmask.astype(bool).sum():
+                if n_here > 0.001 * zone_px:
                     pf.append("finger_may_cover_text")
         pinfo = dict(info)
         if cfg.dewarp:
@@ -661,6 +699,11 @@ def process_video(video_path: str, out_dir: str, cfg: Optional[Config] = None,
 
     pages = [r for r in results if r is not None]
     pages.sort(key=lambda r: (r.frame_index, r.info.get("half", "")))
+    dropped = []
+    if cfg.dedupe:
+        pages, dropped = drop_repeats(pages)
+        for d in dropped:
+            log.info("dropped the %s page from frame %d: %s", d["half"] or "whole", d["frame_index"], d["reason"])
     if cfg.max_pages > 0:
         pages = pages[:cfg.max_pages]  # a spread can overshoot by one
     for n, r in enumerate(pages, 1):
@@ -695,7 +738,7 @@ def process_video(video_path: str, out_dir: str, cfg: Optional[Config] = None,
                     r.image_path = r.photo_path
             with open(os.path.join(out_pages, f"page_{n:04d}.txt"), "w", encoding="utf-8") as f:
                 f.write(r.text)
-    meta = {"video": os.path.abspath(video_path), "fps": fps, "segments": len(segs),
+    meta = {"video": os.path.abspath(video_path), "fps": fps, "segments": len(segs), "dropped": dropped,
             "seconds": round(time.time() - t_start, 1), "config": cfg.to_dict()}
     write_outputs(out_dir, pages, meta, cfg.pdf)
     say("done", 1.0)
