@@ -17,7 +17,7 @@ sys.path.insert(0, HERE)
 import make_test_video as mtv  # noqa: E402
 
 from piffler import Config  # noqa: E402
-from piffler.dewarp import dewarp, find_lines, text_mask  # noqa: E402
+from piffler.dewarp import deshear, dewarp, find_lines, text_mask  # noqa: E402
 from piffler.hands import occluder_mask, skin_mask  # noqa: E402
 from piffler.ocr import Word, reading_order, words_to_text  # noqa: E402
 from piffler.page import detect_page, split_pages  # noqa: E402
@@ -148,6 +148,32 @@ def test_location_prior_turns_off_for_handheld_video():
         held.add(q + np.float32([d, d * 0.5]))
     assert stand.get((200, 200)) is not None
     assert held.get((200, 200)) is None
+
+
+def test_facing_page_strip_is_dropped():
+    from piffler.ocr import Word
+    from piffler.pipeline import _drop_facing_column
+
+    def page(stray_x=None, left_page=False):
+        ws = []
+        for k in range(20):
+            y = 100 + k * 40
+            if stray_x is not None:  # the facing page's line ends, past an empty margin
+                ws.append(Word("xx", 0.9, np.float32([[stray_x, y], [stray_x + 25, y], [stray_x + 25, y + 20], [stray_x, y + 20]])))
+            for j in range(5):
+                x0 = (60 if left_page else 120) + j * 90
+                ws.append(Word("mot", 0.9, np.float32([[x0, y], [x0 + 70, y], [x0 + 70, y + 20], [x0, y + 20]])))
+        return ws
+
+    kept, cut = _drop_facing_column(page(5), 600, gutter_right=False)
+    assert len(kept) == 100 and 30 < cut < 120
+    kept, cut = _drop_facing_column(page(560, left_page=True), 600, gutter_right=True)
+    assert len(kept) == 100 and 480 < cut < 560
+    assert _drop_facing_column(page(), 600, gutter_right=False)[1] is None
+    blank_with_strays = [w for w in page(560, left_page=True) if w.text == "xx"][:4]  # a blank page
+    kept, cut = _drop_facing_column(blank_with_strays, 600, gutter_right=True)
+    assert kept == [] and 500 < cut < 560
+    assert _drop_facing_column(page(left_page=True), 600, gutter_right=True)[1] is None
 
 
 def test_blank_spread_split_at_learned_gutter():
@@ -313,6 +339,47 @@ def test_dewarp_straightens_curled_page():
         lines = find_lines(text_mask(cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)))
         return np.mean([np.ptp(l[:, 1]) for l in lines])
     assert curl_px(out) < 0.6 * curl_px(curled)
+
+
+def _text_page(n_lines=30, w=900, h=1300, seed=4):
+    """A full page of left-aligned lines (ragged right), like a novel's page."""
+    rng = np.random.default_rng(seed)
+    img = np.full((h, w, 3), 236, np.uint8)
+    words = "le golf drouot etait un lieu mythique pour toute une generation de musiciens".split()
+    for k in range(n_lines):
+        y = 90 + k * 38
+        x = 80 + (40 if k % 9 == 0 else 0)  # paragraph indents
+        line = " ".join(rng.choice(words, 9))
+        cv2.putText(img, line, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (40, 40, 40), 2, cv2.LINE_AA)
+    return img
+
+
+def _column_lean(img):
+    from piffler.dewarp import _edge_curve
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    tm = text_mask(g)
+    ys, starts = [], []
+    for ln in find_lines(tm):
+        y = int(np.median(ln[:, 1]))
+        xs = np.nonzero(tm[max(0, y - 8):y + 9].any(0))[0]
+        if len(xs) > 10:
+            ys.append(y); starts.append(xs.min())
+    c, _, _ = _edge_curve(np.float32(starts), np.float32(ys), deg=1)
+    return abs(np.degrees(np.arctan(c[0])))
+
+
+def test_deshear_stands_leaning_column_upright():
+    page = _text_page()
+    h, w = page.shape[:2]
+    a = np.tan(np.radians(4.0))  # the column leans 4 degrees
+    sheared = cv2.warpAffine(page, np.float32([[1, a, -a * h / 2], [0, 1, 0]]), (w, h),
+                             borderMode=cv2.BORDER_REPLICATE)
+    out, info = deshear(sheared)
+    assert _column_lean(sheared) > 3.5
+    assert _column_lean(out) < 0.5, info
+    assert _column_lean(deshear(page)[0]) < 0.5            # an upright page stays upright
+    blank = np.full((900, 600, 3), 235, np.uint8)
+    assert deshear(blank)[1]["deshear_px"] == 0.0
 
 
 def test_dewarp_leaves_blank_and_picture_pages_alone():

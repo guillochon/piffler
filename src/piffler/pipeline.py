@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 
 from .config import Config
-from .dewarp import dewarp, flatten_illumination, text_mask
+from .dewarp import deshear, dewarp, flatten_illumination, text_mask
 from .export import write_outputs
 from .hands import align_to, occluder_mask, remove_fingers, skin_mask
 from .ocr import OCREngine, Word, best_rotation, rotate, words_to_text
@@ -401,6 +401,12 @@ def _process_segment(si: int, seg: Segment, frames: Dict[int, np.ndarray], cfg: 
         if debug_dir:  # before lighting correction, to tune what comes after
             cv2.imwrite(os.path.join(debug_dir, f"seg{si:04d}_{hi}_raw.png"), page)
         page = flatten_illumination(page)
+        if cfg.dewarp:  # level lines can still sit in a leaning column; judged on even light
+            try:
+                page, sinfo = deshear(page)
+                pinfo.setdefault("dewarp", {}).update(sinfo)
+            except Exception as e:
+                log.warning("deshear failed on segment %d: %s", si, e)
         words: List[Word] = []
         if engine is not None:
             words = engine(page)
@@ -409,6 +415,9 @@ def _process_segment(si: int, seg: Segment, frames: Dict[int, np.ndarray], cfg: 
                 # that strip are the facing page's line starts or ends
                 strip, pw = 2 * int(0.015 * region.shape[1]), page.shape[1]
                 words = [w for w in words if (w.x0 <= pw - strip if hi == 0 else w.box[:, 0].max() >= strip)]
+                words, cut = _drop_facing_column(words, pw, gutter_right=(hi == 0))
+                if cut is not None:
+                    pinfo["facing_cut_px"] = cut
             if not words:
                 pf.append("no_text_found")
             elif np.mean([w.score for w in words]) < 0.75:
@@ -421,6 +430,58 @@ def _process_segment(si: int, seg: Segment, frames: Dict[int, np.ndarray], cfg: 
             r.info["overlap_px"] = int(0.015 * region.shape[1])
         results.append(r)
     return results
+
+
+def _paper_tone(img: np.ndarray) -> np.ndarray:
+    """The page's typical paper colour (BGR)."""
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return np.median(img[g >= np.percentile(g, 70)], axis=0).astype(np.uint8)
+
+
+def _drop_facing_column(words: List[Word], pw: int, gutter_right: bool):
+    """Words in a narrow strip at the gutter, cut off from the page's own text
+    by an empty margin, are the facing page's line ends or starts (the split
+    landed a little off). Returns (kept words, x of that margin) - x is None
+    when there is no such strip."""
+    if not words:
+        return words, None
+    lh = float(np.median([w.height for w in words]))
+    band = int(0.15 * pw)  # facing-page leftovers sit right at the gutter
+    if len(words) < 12:
+        # an otherwise blank page whose only "words" are a stack hard against the
+        # gutter: the facing page's line starts or ends
+        near = [w for w in words if (w.x0 > pw - band if gutter_right else w.box[:, 0].max() < band)]
+        if len(near) == len(words) and len(near) >= 3:
+            if gutter_right:
+                return [], int(min(w.x0 for w in near) - 0.3 * lh)
+            return [], int(max(w.box[:, 0].max() for w in near) + 0.3 * lh)
+        return words, None
+    occ = np.zeros(pw + 1, np.int32)  # how many words cover each x
+    for w in words:
+        a, b = int(max(0, w.x0)), int(min(pw, w.box[:, 0].max()))
+        occ[a:b + 1] += 1
+    prof = occ[pw - band:][::-1] if gutter_right else occ[:band]  # walking inward from the gutter
+    # the margin: the first long empty run after some ink, walking from the gutter
+    inked, run, start, found = False, 0, None, False
+    for k, v in enumerate(prof):
+        if v > 0:
+            if inked and run >= 0.8 * lh:
+                found = True
+                break
+            inked, run, start = True, 0, None
+        elif inked:
+            start = k if start is None else start
+            run += 1
+    found = found or (inked and run >= 0.8 * lh)  # the page's own text starts past the band
+    if not found:
+        return words, None
+    gap_mid = start + run // 2
+    cut = (pw - gap_mid) if gutter_right else gap_mid
+    stray = [w for w in words if (w.x0 > cut if gutter_right else w.box[:, 0].max() < cut)]
+    if not stray or len(stray) > 0.3 * len(words):
+        return words, None
+    keep = [w for w in words if all(w is not x for x in stray)]
+    return keep, int(cut)
 
 
 def _load_stats(path: str, key: str) -> Optional[FrameStats]:
@@ -507,8 +568,11 @@ def process_video(video_path: str, out_dir: str, cfg: Optional[Config] = None,
                 after = sorted((r for r in kept_refs if r[0] > si), key=lambda r: r[0])[:1]
                 for entry in after + before:
                     psi, pthumb, pscore, pidx = entry[:4]
-                    sim = page_similarity(thumb, pthumb)
-                    log.debug("segment %d vs %d: sim %.3f", si, psi, sim)
+                    # like every hold already pooled for that page, not just the latest:
+                    # a hold caught mid-turn resembles both pages and would chain them
+                    pool_thumbs = entry[6] if len(entry) > 6 else [pthumb]
+                    sim = min(page_similarity(thumb, t) for t in pool_thumbs)
+                    log.debug("segment %d vs %d: sim %.3f (over %d holds)", si, psi, sim, len(pool_thumbs))
                     if sim < cfg.dedupe_similarity:
                         continue
                     adjacent = any(entry is e for e in after) or (before and entry is before[0])
@@ -558,9 +622,11 @@ def process_video(video_path: str, out_dir: str, cfg: Optional[Config] = None,
                     pooled.update(replaces[5])
                 ids = ids[:12]
                 pooled = {i: pooled[i] for i in ids}
-                kept_refs.append((si, thumb, max(seg.scores), idxs, ids, pooled))
+                thumbs = ((list(replaces[6]) if replaces is not None and len(replaces) > 6 else
+                           [replaces[1]] if replaces is not None else []) + [thumb])[-4:]
+                kept_refs.append((si, thumb, max(seg.scores), idxs, ids, pooled, thumbs))
                 latest = sorted(kept_refs, key=lambda e: -e[0])[:2]
-                kept_refs[:] = [e if e[5] is None or any(e is k for k in latest) else e[:5] + (None,)
+                kept_refs[:] = [e if e[5] is None or any(e is k for k in latest) else e[:5] + (None,) + e[6:]
                                 for e in kept_refs]
             return True
 
@@ -601,6 +667,13 @@ def process_video(video_path: str, out_dir: str, cfg: Optional[Config] = None,
         r.page_no = n
         img = getattr(r, "_image", None)
         if img is not None:
+            cut = r.info.get("facing_cut_px")
+            if cut is not None:  # the facing page's strip at the gutter becomes paper
+                img = img.copy()
+                if r.info.get("half") == "left":
+                    img[:, cut:] = _paper_tone(img)
+                else:
+                    img[:, :cut] = _paper_tone(img)
             r.photo_path = os.path.join(out_pages, f"page_{n:04d}_photo.jpg")
             cv2.imwrite(r.photo_path, img, [cv2.IMWRITE_JPEG_QUALITY, cfg.jpeg_quality])
             r.image_path = r.photo_path

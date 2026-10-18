@@ -10,7 +10,7 @@ input (pictures, blank pages, blur) falls back to the undistorted crop.
 from __future__ import annotations
 
 import logging
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -188,3 +188,91 @@ def flatten_illumination(img: np.ndarray, strength: float = 1.0) -> np.ndarray:
     out = img.astype(np.float32) * gain
     return np.clip(out, 0, 255).astype(np.uint8)
 
+
+
+
+def _edge_curve(x: np.ndarray, y: np.ndarray, deg: int = 2):
+    """Robust smooth curve x = f(y) through a column edge, ignoring indents and
+    short lines (outliers). Returns (poly coeffs, median residual, inliers) or None."""
+    if len(x) < 8:
+        return None
+    deg = deg if len(x) >= 12 else 1
+    c = np.polyfit(y, x, deg)
+    keep = np.ones(len(x), bool)
+    for _ in range(3):
+        r = np.abs(x - np.polyval(c, y))
+        keep = r < max(2.0, 2.0 * np.median(r))
+        if keep.sum() < 6:
+            return None
+        c = np.polyfit(y[keep], x[keep], deg)
+    r = np.abs(x[keep] - np.polyval(c, y[keep]))
+    return c, float(np.median(r)), int(keep.sum())
+
+
+def deshear(img: np.ndarray, work_height: int = 1400) -> Tuple[np.ndarray, dict]:
+    """Make the text column upright and evenly wide (horizontal flattening).
+
+    Straightening lines moves pixels up and down only, so a page that is curved
+    or rectified slightly askew keeps level lines in a leaning, bowed column.
+    In justified text every full line starts and ends on the column edges, so
+    the left and right edges are fitted as smooth curves of height, and each
+    row is stretched horizontally so both edges stand straight and vertical."""
+    info = {"deshear_px": 0.0}
+    H0, W0 = img.shape[:2]
+    s = min(1.0, work_height / float(H0))
+    small = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA) if s < 1 else img
+    g = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY) if small.ndim == 3 else small
+    tm = text_mask(g)
+    lines = find_lines(tm)
+    if len(lines) < 8:
+        info["reason"] = "too_few_text_lines"
+        return img, info
+    hh = max(2, int(np.median([np.ptp(l[:, 1]) for l in lines]) + 3))
+    L, R, Y = [], [], []
+    for ln in lines:
+        y = int(np.median(ln[:, 1]))
+        xs = np.nonzero(tm[max(0, y - hh):y + hh + 1].any(0))[0]
+        if len(xs) >= 10:
+            L.append(xs.min()); R.append(xs.max()); Y.append(y)
+    L, R, Y = (np.array(v, np.float32) for v in (L, R, Y))
+    fl, fr = _edge_curve(L, Y), _edge_curve(R, Y)
+    tol = max(2.5, 0.004 * g.shape[1])
+    clean = [f is not None and f[1] <= tol and f[2] >= 0.6 * len(Y) for f in (fl, fr)]
+    if not any(clean):
+        # neither edge is a clean column edge (centred captions, a picture beside the text)
+        info["reason"] = "no_clean_column_edges"
+        return img, info
+    ys = np.arange(g.shape[0], dtype=np.float32)
+    y0, y1 = float(Y.min()), float(Y.max())
+    yc = np.clip(ys, y0, y1)  # beyond the text, hold the edge where the text ends
+    span = slice(int(y0), int(y1) + 1)
+    if all(clean):  # justified: straighten both edges, evening out the width
+        le, re = np.polyval(fl[0], yc), np.polyval(fr[0], yc)
+        L0, R0 = float(np.median(le[span])), float(np.median(re[span]))
+    else:  # ragged on one side: follow the clean edge, shifting rows without stretching
+        x, f = (L, fl) if clean[0] else (R, fr)
+        e = np.polyval(f[0], yc)
+        e0 = float(np.median(e[span]))
+        width = float(np.median(R - L))
+        le, re = (e, e + width) if clean[0] else (e - width, e)
+        L0, R0 = (e0, e0 + width) if clean[0] else (e0 - width, e0)
+        info["edge"] = "left" if clean[0] else "right"
+    width = re - le
+    shift = max(np.abs(le - L0).max(), np.abs(re - R0).max())
+    info["deshear_px"] = round(float(shift / s), 1)
+    if shift < 1.0:
+        info["reason"] = "upright"
+        return img, info
+    if shift > 0.10 * g.shape[1] or width.min() < 0.85 * (R0 - L0) or width.max() > 1.15 * (R0 - L0):
+        info["reason"] = "implausible"
+        info["deshear_px"] = 0.0
+        return img, info
+    # source x for each output x on each row: maps [L0, R0] onto that row's [le, re]
+    scale_row = (width / (R0 - L0)).astype(np.float32)
+    xs_out = np.arange(W0, dtype=np.float32) * s
+    le_full = cv2.resize(le.reshape(-1, 1).astype(np.float32), (1, H0), interpolation=cv2.INTER_LINEAR).ravel()
+    sc_full = cv2.resize(scale_row.reshape(-1, 1), (1, H0), interpolation=cv2.INTER_LINEAR).ravel()
+    map_x = ((le_full[:, None] + (xs_out[None, :] - L0) * sc_full[:, None]) / s).astype(np.float32)
+    map_y = np.repeat(np.arange(H0, dtype=np.float32)[:, None], W0, axis=1)
+    out = cv2.remap(img, map_x, map_y, interpolation=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    return out, info

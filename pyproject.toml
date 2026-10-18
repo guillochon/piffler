@@ -1,13 +1,39 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "piffler"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Turn a video of someone flipping through a book into clean, dewarped, OCR'd page scans."
-readme = "README.md"
+readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "guillochon"}]
+keywords = [
+    "ocr", "book scanning", "document scanning", "dewarp", "video",
+    "page detection", "searchable pdf", "digitization", "opencv",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Graphics :: Capture :: Scanners",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "Topic :: Text Processing",
+    "Topic :: Text Processing :: General",
+]
 dependencies = [
     "numpy>=1.22",
     "opencv-python-headless>=4.6",
@@ -23,8 +49,18 @@ dependencies = [
 pdf = ["reportlab>=3.6"]
 test = ["pytest>=7"]
 
+[project.urls]
+Homepage = "https://github.com/guillochon/piffler"
+Repository = "https://github.com/guillochon/piffler"
+Issues = "https://github.com/guillochon/piffler/issues"
+Changelog = "https://github.com/guillochon/piffler/blob/main/CHANGELOG.md"
+
 [project.scripts]
 piffler = "piffler.cli:main"
 
+[tool.setuptools.dynamic]
+version = {attr = "piffler.__version__"}
+
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["piffler*"]

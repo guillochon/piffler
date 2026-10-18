@@ -353,7 +353,7 @@ def split_pages(img: np.ndarray, layout: str = "auto",
     log.debug("gutter own x=%s (%.3f) conf=%.2f hint=%s", x, (x or 0) / float(w), conf, hint)
     # a photo's edge or a blank column can pose as the binding, so a gutter far
     # from where this book's gutter usually sits is looked for again near it
-    if hint is not None and (conf < 0.5 or x is None or abs(x / float(w) - hint) > 0.08):
+    if hint is not None and (conf < 0.5 or x is None or abs(x / float(w) - hint) > 0.05):
         x2, conf2 = find_gutter(img, max(0.2, hint - 0.06), min(0.8, hint + 0.06))
         log.debug("gutter near hint: x=%s (%.3f) conf=%.2f", x2, (x2 or 0) / float(w), conf2)
         lo_, hi_ = max(0.2, hint - 0.06), min(0.8, hint + 0.06)

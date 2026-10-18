@@ -3,9 +3,11 @@
 Turn a phone video of you flipping through a book into clean page scans, plain text, and a searchable PDF. The book stays intact: no flatbed, no pressing the spine.
 
 ```
-pip install -e ".[pdf]"
+pip install "piffler[pdf]"
 piffler my_book.mp4 -o my_book/
 ```
+
+ffmpeg on your PATH is recommended (faster, GPU-accelerated decoding); without it, OpenCV decodes the video.
 
 Output:
 
@@ -64,6 +66,13 @@ from piffler import Config, process_video
 pages = process_video("book.mp4", "out/", Config(layout="spread", min_hold_s=0.5))
 for p in pages:
     print(p.page_no, p.mean_score, p.flags, p.text[:80])
+```
+
+## Development
+
+```
+git clone https://github.com/guillochon/piffler && cd piffler
+pip install -e ".[pdf,test]"
 ```
 
 ## Tests
