@@ -1,5 +1,9 @@
 # Piffler the Page Riffler
 
+[![CI](https://github.com/guillochon/piffler/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/guillochon/piffler/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/piffler)](https://pypi.org/project/piffler/)
+[![Python](https://img.shields.io/pypi/pyversions/piffler)](https://pypi.org/project/piffler/)
+
 Turn a phone video of you flipping through a book into clean page scans, plain text, and a searchable PDF. The book stays intact: no flatbed, no pressing the spine.
 
 ![Piffler riffling through a book](https://github.com/guillochon/piffler/blob/main/docs/piffler.gif?raw=true)
