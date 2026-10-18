@@ -85,6 +85,10 @@ python tests/make_test_video.py demo.mp4   # make the test video yourself
 
 The test video mixes real photos of curved, yellowed book pages (from the MIT-licensed [page-dewarp](https://github.com/lmmx/page-dewarp) examples) with rendered pages of known text. It simulates handheld shake, exposure drift, page-turn motion, fingers, a too-short hold, a mid-page hesitation, a dark page, a two-page spread, and a corrupted file tail. On it, every page is found once, and OCR matches ground truth at 100% character similarity on all unobstructed pages.
 
+## Releasing
+
+CI (`.github/workflows/ci.yml`) runs the tests on Linux (Python 3.9-3.13), Windows and macOS, the end-to-end test, and a package build on every push and pull request. Publishing a GitHub release tagged `vX.Y.Z` (matching `piffler.__version__`) uploads to PyPI through `.github/workflows/publish.yml`; running that workflow by hand uploads to TestPyPI instead. It uses PyPI Trusted Publishing, which needs a one-time setup: on PyPI (and TestPyPI), add a pending publisher for project `piffler`, owner `guillochon`, repository `piffler`, workflow `publish.yml`, environment `pypi` (`testpypi` on TestPyPI).
+
 ## Known limitations
 
 - **Pauses are required.** Pages turned without any pause can be missed (they are reported, not silently dropped).

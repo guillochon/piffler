@@ -38,9 +38,11 @@ def _first_font(*paths):
 
 
 FONT = _first_font("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
-                   "/Library/Fonts/Georgia.ttf", "C:/Windows/Fonts/georgia.ttf")
+                   "/Library/Fonts/Georgia.ttf", "/System/Library/Fonts/Supplemental/Georgia.ttf",
+                   "C:/Windows/Fonts/georgia.ttf")
 FONT_B = _first_font("/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
-                     "/Library/Fonts/Georgia Bold.ttf", "C:/Windows/Fonts/georgiab.ttf")
+                     "/Library/Fonts/Georgia Bold.ttf", "/System/Library/Fonts/Supplemental/Georgia Bold.ttf",
+                     "C:/Windows/Fonts/georgiab.ttf")
 
 TEXTS = [
     ("On Sewing the Signatures",
