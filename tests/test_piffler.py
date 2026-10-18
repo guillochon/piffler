@@ -200,6 +200,37 @@ def test_repeated_pages_are_dropped():
     assert len(dropped) == 2
 
 
+def test_fix_redoes_only_chosen_pages(tmp_path, monkeypatch):
+    import piffler.fix as fx
+    frames, _ = _page_frames(3)
+    p = _write(str(tmp_path / "v.mp4"), frames)
+    out = str(tmp_path / "out")
+    pages = process_video(p, out, Config(pdf=False))
+    assert len(pages) == 3
+    before = {q.id: open(q.image_path, "rb").read() for q in pages}
+
+    rep = fx.fix(out, pages=["2"], settings={"expand_page": 0.05}, drop=["3"])
+    assert rep["pages"] == 2 and rep["dropped"] == [pages[2].id]
+    ov = json.load(open(os.path.join(out, "overrides.json")))
+    assert ov[f"s{pages[1].segment}"] == {"expand_page": 0.05} and ov[pages[2].id] == {"drop": True}
+    m = json.load(open(os.path.join(out, "manifest.json")))
+    assert [q["id"] for q in m["pages"]] == [pages[0].id, pages[1].id]
+    assert "adjusted" in m["pages"][1]["flags"]
+    # untouched page reused as is, redone page made again
+    assert open(os.path.join(out, m["pages"][0]["image"]), "rb").read() == before[pages[0].id]
+    assert open(os.path.join(out, m["pages"][1]["image"]), "rb").read() != before[pages[1].id]
+
+    # a full run applies the saved overrides too
+    again = process_video(p, out, Config(pdf=False))
+    assert [q.id for q in again] == [pages[0].id, pages[1].id]
+
+    # auto: variants are tried and scored; a page is changed only if a variant wins
+    monkeypatch.setattr(fx, "problems", lambda q: ["text_at_edge"])
+    rep = fx.fix(out, pages=["1"], auto=True)
+    assert len(rep["auto"]) == 1 and rep["auto"][0]["tried"] >= 2
+    assert rep["pages"] == 2
+
+
 def test_blank_spread_split_at_learned_gutter():
     spread = np.full((700, 800, 3), 235, np.uint8)  # two blank pages: no gutter to see
     halves, flags, sure = split_pages(spread, "auto", hint=0.45)

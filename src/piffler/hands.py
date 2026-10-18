@@ -200,7 +200,8 @@ def occluder_mask(ref: np.ndarray, others: List[np.ndarray], region: Optional[np
 
 
 def remove_fingers(ref: np.ndarray, others: List[np.ndarray], region: Optional[np.ndarray] = None,
-                   paper_delta: float = 14.0, extra: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray, dict]:
+                   paper_delta: float = 14.0, extra: Optional[np.ndarray] = None,
+                   misfit: float = 0.08) -> Tuple[np.ndarray, np.ndarray, dict]:
     """Remove hands from ``ref`` using other frames of the same still page.
     ``extra`` adds occluders found some other way (see ``occluder_mask``).
 
@@ -261,7 +262,7 @@ def remove_fingers(ref: np.ndarray, others: List[np.ndarray], region: Optional[n
             # compare print, not paper: the error over the darker (inked) ring pixels
             inked = ring & (gr < np.percentile(gr[ring], 30))
             err = float(np.median(np.abs(gr[inked] - gw[inked]))) if inked.sum() > 50 else 0.0
-            if err > 0.08 * gr[ring].mean():  # misfit print, judged against the paper's brightness
+            if err > misfit * gr[ring].mean():  # misfit print, judged against the paper's brightness
                 stats["rejected"] = stats.get("rejected", 0) + 1
                 continue
         stack.append(warped)

@@ -335,8 +335,8 @@ def find_gutter(img: np.ndarray, lo_frac: float = 0.33, hi_frac: float = 0.67) -
     return int(round(x / s)), conf
 
 
-def split_pages(img: np.ndarray, layout: str = "auto",
-                hint: Optional[float] = None) -> Tuple[List[np.ndarray], List[str], Optional[float]]:
+def split_pages(img: np.ndarray, layout: str = "auto", hint: Optional[float] = None,
+                force: Optional[float] = None) -> Tuple[List[np.ndarray], List[str], Optional[float]]:
     """Split a spread at its gutter. Returns (pages, flags, gutter x / width
     when it was found confidently, else None).
 
@@ -349,6 +349,10 @@ def split_pages(img: np.ndarray, layout: str = "auto",
     flags: List[str] = []
     if layout == "single":
         return [img], flags, None
+    if force is not None:  # split where the caller says (a recovery override)
+        x = int(round(force * w))
+        overlap = int(0.015 * w)
+        return [img[:, : x + overlap], img[:, max(0, x - overlap):]], ["gutter_set_by_hand"], None
     x, conf = find_gutter(img)
     log.debug("gutter own x=%s (%.3f) conf=%.2f hint=%s", x, (x or 0) / float(w), conf, hint)
     # a photo's edge or a blank column can pose as the binding, so a gutter far

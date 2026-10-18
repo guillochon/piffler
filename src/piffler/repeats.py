@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from typing import List, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 
 def _bigrams(text: str) -> Set[Tuple[str, str]]:
@@ -27,9 +27,17 @@ def _badness(p, spread_book: bool) -> tuple:
     return (unsplit, guessed, len(p.flags), -p.mean_score, -len(p.text))
 
 
+def _pid(p) -> str:
+    half = p.info.get("half")
+    return f"s{p.segment}" + (f"-{half}" if half else "")
+
+
 def drop_repeats(pages: list, window: int = 4, min_bigrams: int = 20,
-                 overlap: float = 0.4) -> Tuple[list, List[dict]]:
-    """Pages in output order -> (kept pages, dropped [{page, reason, ...}])."""
+                 overlap: float = 0.4, keep: Optional[Set[str]] = None) -> Tuple[list, List[dict]]:
+    """Pages in output order -> (kept pages, dropped [{id, reason, ...}]).
+    Pages whose id is in `keep` are never dropped (a recovery override)."""
+    keep = keep or set()
+    protected = {m for m, p in enumerate(pages) if _pid(p) in keep}
     B = [_bigrams(p.text) for p in pages]
     spread_book = sum(p.info.get("half") is not None for p in pages) > 0.5 * max(1, len(pages))
     dropped = {}  # index -> reason
@@ -46,7 +54,9 @@ def drop_repeats(pages: list, window: int = 4, min_bigrams: int = 20,
                 shared = len(B[i] & B[j])
                 if max(shared / len(B[i]), shared / len(B[j])) < overlap:
                     continue
-                worse = max((i, j), key=lambda k: _badness(pages[k], spread_book))
+                if i in protected and j in protected:
+                    continue
+                worse = max((i, j), key=lambda k: (k not in protected, _badness(pages[k], spread_book)))
                 other = pages[j if worse == i else i]
                 if pages[worse].frame_index > other.frame_index:
                     later.add(worse)
@@ -59,14 +69,14 @@ def drop_repeats(pages: list, window: int = 4, min_bigrams: int = 20,
     # when it shows nothing of its own (little or no text)
     for k in [k for k in dropped if k in later]:
         for m, p in enumerate(pages):
-            if m not in dropped and p.segment == pages[k].segment and len(B[m]) < min_bigrams:
+            if m not in dropped and m not in protected and p.segment == pages[k].segment                     and len(B[m]) < min_bigrams:
                 dropped[m] = "partner of a repeated page, little text of its own"
     # the book wasn't found in the frame at all and nothing on it is readable
     for m, p in enumerate(pages):
-        if m not in dropped and "page_from_neighbors" in p.flags and len(p.text.strip()) < 20:
+        if m not in dropped and m not in protected and "page_from_neighbors" in p.flags                 and len(p.text.strip()) < 20:
             dropped[m] = "book not found in this frame, nothing readable"
     kept = [p for m, p in enumerate(pages) if m not in dropped]
-    info = [{"segment": pages[m].segment, "frame_index": pages[m].frame_index,
+    info = [{"id": _pid(pages[m]), "segment": pages[m].segment, "frame_index": pages[m].frame_index,
              "time_s": round(pages[m].time_s, 2), "half": pages[m].info.get("half"),
              "chars": len(pages[m].text), "reason": r} for m, r in sorted(dropped.items())]
     return kept, info

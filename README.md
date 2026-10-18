@@ -3,7 +3,7 @@
 Turn a phone video of you flipping through a book into clean page scans, plain text, and a searchable PDF. The book stays intact: no flatbed, no pressing the spine.
 
 ```
-pip install "piffler[pdf]"
+pip install piffler
 piffler my_book.mp4 -o my_book/
 ```
 
@@ -23,6 +23,21 @@ my_book/
 ```
 
 Useful options: `--max-pages N` to try the first few pages, `--cpu` to stay off the GPU, `--no-scan` to put the photos in the PDF instead of clean scans.
+
+## Fixing pages
+
+Pages listed under `needs_review` in `manifest.json` (and printed at the end of a run) can be redone on their own, without reprocessing the book. Each page has a stable id such as `s142-left` (its hold of the video, and which half of the spread), and remembers the frames and context it was made from. `piffler fix` decodes only the frames it needs, redoes those pages and reassembles the outputs, reusing every other page as it is. A fix takes seconds to a few minutes; a full run of a 200-page book takes about 25.
+
+```
+piffler fix my_book/ --auto                          # try variants on every flagged page, keep what scores best
+piffler fix my_book/ --pages 68,88 --set gutter=0.53 # set something by hand
+piffler fix my_book/ --drop 143                      # remove a page
+piffler fix my_book/ --keep s150-left                # restore a page that was dropped as a repeat
+```
+
+Settings: `gutter` (split position, 0-1), `expand_page` (grow the page outline, e.g. 0.03), `outline=neighbors` (use the book's usual position), `frames=all` (look at every frame of the hold, not just the best few), `ref_frame` / `exclude_frames` (frame numbers), `fill_fingers=false`, `misfit` (how closely another frame must line up to fill in a hand; default 0.08, lower is stricter), `layout=single|spread`, `dewarp=false`, `deshear=false`.
+
+`--auto` matches each flagged page's problem to a few variants: a hand over text tries more frames and stricter matching; text cut at an edge tries a larger outline and nearby split positions; ghosted text tries stricter matching or no hand filling. Each variant is scored (confidently read text, minus text a hand may hide, words cut at an edge, and text that belongs to a neighbouring page), and a page changes only if a variant clearly beats it. Everything chosen, by hand or automatically, is saved in `my_book/overrides.json` and applied by every later run.
 
 ## GPU
 
@@ -72,7 +87,7 @@ for p in pages:
 
 ```
 git clone https://github.com/guillochon/piffler && cd piffler
-pip install -e ".[pdf,test]"
+pip install -e ".[test]"
 ```
 
 ## Tests

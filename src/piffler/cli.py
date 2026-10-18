@@ -1,13 +1,87 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 
 from .config import Config
 
 
+def _value(v: str):
+    try:
+        return json.loads(v)
+    except ValueError:
+        return v
+
+
+def _split(v):
+    return [x for part in (v or []) for x in part.split(",") if x.strip()]
+
+
+def _progress(stage, frac):
+    sys.stderr.write(f"\r{stage:>10}: {frac * 100:5.1f}%")
+    if frac >= 1.0:
+        sys.stderr.write("\n")
+    sys.stderr.flush()
+
+
+def fix_main(argv) -> int:
+    ap = argparse.ArgumentParser(
+        prog="piffler fix",
+        description="Redo chosen pages of a finished book with different settings, without reprocessing it. "
+                    "Settings are saved in OUT/overrides.json and applied by every later run.",
+        epilog="settings: ref_frame=N, exclude_frames=[N,..], frames=all, fill_fingers=false, misfit=0.05, "
+               "expand_page=0.03, outline=neighbors, layout=single|spread, gutter=0.52, dewarp=false, "
+               "deshear=false")
+    ap.add_argument("out", help="output folder of an earlier run")
+    ap.add_argument("--pages", action="append", help="page numbers or ids (s142-left), comma-separated")
+    ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE", help="setting for --pages")
+    ap.add_argument("--drop", action="append", help="pages to remove")
+    ap.add_argument("--keep", action="append", help="pages never to drop (ids of dropped pages restore them)")
+    ap.add_argument("--auto", action="store_true",
+                    help="try variants on flagged pages (or on --pages) and keep what scores best")
+    ap.add_argument("--video", help="the video, if it has moved since the run")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    a = ap.parse_args(argv)
+    logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
+                        format="%(levelname)s %(name)s: %(message)s")
+    settings = {}
+    for kv in a.set:
+        if "=" not in kv:
+            ap.error(f"--set needs KEY=VALUE, got {kv!r}")
+        k, v = kv.split("=", 1)
+        settings[k.strip()] = _value(v.strip())
+    if settings and not a.pages:
+        ap.error("--set needs --pages")
+    from .fix import fix
+    try:
+        rep = fix(a.out, _split(a.pages), settings, _split(a.drop), _split(a.keep), a.auto, a.video,
+                  progress=_progress)
+    except (ValueError, RuntimeError, OSError) as e:
+        sys.stderr.write(f"error: {e}\n")
+        return 2
+    for pid, st in rep["set"].items():
+        print(f"{pid}: set {st}")
+    for pid in rep["dropped"]:
+        print(f"{pid}: dropped")
+    for pid in rep["restored"]:
+        print(f"{pid}: kept")
+    for e in rep["auto"]:
+        res = f"applied {e['applied']}" if e["applied"] else "kept as is"
+        print(f"{e['hold']} ({', '.join(e['problems'])}): tried {e['tried']}, score {e['baseline']} -> "
+              f"{e['best']}, {res}")
+    if a.auto and not rep["auto"]:
+        print(f"Nothing to try: {rep.get('checked', 0)} page(s) checked, none with a problem recovery can address.")
+    if "pages" in rep:
+        print(f"{rep['pages']} pages; worth a look: {rep['needs_review']}")
+    return 0
+
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "fix":
+        return fix_main(argv[1:])
     ap = argparse.ArgumentParser(prog="piffler",
                                  description="Turn a page-flipping video into page scans + OCR text.")
     ap.add_argument("video")

@@ -1,8 +1,10 @@
 """End-to-end: video -> still segments -> clean pages -> OCR -> outputs."""
 from __future__ import annotations
 
+import json
 import logging
 import os
+import shutil
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
@@ -50,12 +52,18 @@ class PageResult:
         return float(np.mean([w.score for w in self.words])) if self.words else 0.0
 
     @property
+    def id(self) -> str:
+        """Stable name for this page across runs and fixes: its hold, and which half."""
+        half = self.info.get("half")
+        return f"s{self.segment}" + (f"-{half}" if half else "")
+
+    @property
     def needs_review(self) -> bool:
         return bool(REVIEW_FLAGS.intersection(self.flags))
 
     def to_dict(self, root: str = ""):
         return {
-            "page": self.page_no, "segment": self.segment, "frame_index": self.frame_index,
+            "page": self.page_no, "id": self.id, "segment": self.segment, "frame_index": self.frame_index,
             "time_s": round(self.time_s, 2),
             "image": os.path.relpath(self.image_path, root) if root and self.image_path else self.image_path,
             "photo": os.path.relpath(self.photo_path, root) if root and self.photo_path else self.photo_path,
@@ -270,12 +278,21 @@ def _consensus_cover(pool: Dict[int, np.ndarray], order: List[int], zone: np.nda
 def _process_segment(si: int, seg: Segment, frames: Dict[int, np.ndarray], cfg: Config,
                      engine: Optional[OCREngine], orient: _Orientation, fps: float,
                      out_pages: str, debug_dir: Optional[str], prior: _PagePrior,
-                     allow_defer: bool, extra=None) -> List[PageResult]:
+                     allow_defer: bool, extra=None, ov: Optional[Dict] = None) -> List[PageResult]:
     """`extra` is an earlier hold of the same page, (first frame index, frame ids
     best-first, frames): its frames
     join the pool, so the frame least covered by fingers can come from either
-    hold and the other hold's frames can fill in where fingers were."""
-    cands = [i for i in seg.candidates if i in frames]
+    hold and the other hold's frames can fill in where fingers were.
+
+    `ov` holds recovery overrides for this hold (see piffler.fix): ref_frame,
+    exclude_frames, fill_fingers, misfit, expand_page, outline, layout, gutter,
+    dewarp, deshear."""
+    ov = ov or {}
+    excl = set(ov.get("exclude_frames", []))
+    # everything needed to redo this page later on its own (piffler fix)
+    ctx = {"prior_quads": [np.round(q, 2).tolist() for q in prior.quads], "prior_gutters": list(prior.gutters),
+           "rot": orient.locked}
+    cands = [i for i in seg.candidates if i in frames and i not in excl]
     if not cands:
         r = PageResult(0, si, seg.best, seg.t0, flags=seg.flags + ["frame_decode_failed"])
         return [r]
@@ -308,11 +325,21 @@ def _process_segment(si: int, seg: Segment, frames: Dict[int, np.ndarray], cfg: 
             cv2.fillPoly(pmask, [quad.astype(np.int32)], 255)
     else:
         prior.add(quad)
+    if ov.get("outline") == "neighbors" and known is not None:
+        quad, pmask = known
+        pflags = ["outline_set_by_hand"]  # chosen, not guessed: not a reason to review
+    if ov.get("expand_page"):  # grow the outline: page edges or text were cut off
+        c = quad.mean(0)
+        quad = (c + (quad - c) * (1.0 + float(ov["expand_page"]))).astype(np.float32)
+        quad[:, 0] = np.clip(quad[:, 0], 0, det.shape[1] - 1)
+        quad[:, 1] = np.clip(quad[:, 1], 0, det.shape[0] - 1)
+        pmask = np.zeros(det.shape[:2], np.uint8)
+        cv2.fillPoly(pmask, [quad.astype(np.int32)], 255)
     flags += pflags
     holds = [(quad * ds, pmask, cands, frames)]  # (quad, page mask at det scale, frame ids, frames)
     if extra is not None:
         estart, eids, eframes = extra
-        ecands = [i for i in eids if i in eframes and i not in frames]
+        ecands = [i for i in eids if i in eframes and i not in frames and i not in excl]
         if ecands:
             edet = _resize_long(eframes[ecands[0]], cfg.detect_long_side)
             equad, emask, eflags = detect_page(edet, pmask)
@@ -320,6 +347,7 @@ def _process_segment(si: int, seg: Segment, frames: Dict[int, np.ndarray], cfg: 
                 equad, emask = quad, pmask
             holds.append((equad * ds, emask, ecands, eframes))
             info["merged_hold"] = int(estart)
+            ctx["extra"] = {"start": int(estart), "ids": [int(i) for i in ecands]}
             flags = [f for f in flags if f != "short_hold"]
     H, W = ref.shape[:2]
     allq = np.concatenate([h[0] for h in holds])
@@ -354,7 +382,10 @@ def _process_segment(si: int, seg: Segment, frames: Dict[int, np.ndarray], cfg: 
         for i in order:  # a frame that won't align with the rest can't be vouched for
             cover[i] = max(cover[i], agree.get(i, cover[i] + 0.01)) if agree else cover[i]
     ref_idx = min(order, key=lambda i: (round(cover[i], 3), order.index(i)))
+    if ov.get("ref_frame") in pool:
+        ref_idx = int(ov["ref_frame"])
     info["finger_cover"] = round(cover[ref_idx], 4)
+    ctx["hold_ids"] = [int(i) for i in cands]
     if debug_dir:  # every pooled frame with its hands (red), text block (green) and score
         tiles = []
         for i in order:
@@ -376,10 +407,11 @@ def _process_segment(si: int, seg: Segment, frames: Dict[int, np.ndarray], cfg: 
 
     clean = ref
     covered_pts = None
-    if cfg.remove_fingers:
+    if cfg.remove_fingers and ov.get("fill_fingers", True):
         others = [frames[i] for i in cands[1:]]
         occ = occluder_mask(ref, others, pmask)  # colour-free: catches what skin colour misses
-        clean, residual, fstats = remove_fingers(ref, others, pmask, cfg.skin_paper_delta, extra=occ)
+        clean, residual, fstats = remove_fingers(ref, others, pmask, cfg.skin_paper_delta, extra=occ,
+                                                 misfit=float(ov.get("misfit", 0.08)))
         fstats["occluder_frac"] = float((occ > 0).sum()) / max(1, int((pmask > 0).sum()))
         info["fingers"] = {k: round(v, 4) if isinstance(v, float) else v for k, v in fstats.items()}
         if residual.any():
@@ -408,14 +440,20 @@ def _process_segment(si: int, seg: Segment, frames: Dict[int, np.ndarray], cfg: 
         region = rotate(region, rot)
         info["auto_rotated"] = rot
     aspect = region.shape[1] / float(region.shape[0])
-    hint = prior.gutter() if aspect > 0.85 and cfg.layout == "auto" else None
+    layout = ov.get("layout", cfg.layout)
+    hint = prior.gutter() if aspect > 0.85 and layout == "auto" else None
     log.debug("segment %d: splitting (aspect %.2f)", si, aspect)
-    halves, sflags, sure = split_pages(region, cfg.layout, hint)
+    force = ov.get("gutter")
+    if force is None and layout == "spread" and hint is not None:
+        force = hint
+    halves, sflags, sure = split_pages(region, layout, hint, force=force)
     if sure is not None:
         prior.add_gutter(sure)
-    elif hint is None and aspect > 0.85 and cfg.layout == "auto" and allow_defer:
+    elif hint is None and aspect > 0.85 and layout == "auto" and allow_defer:
         raise _Deferred()  # a spread-shaped page with an unclear gutter: wait for a confident one
     flags += sflags
+    if len(halves) > 1:
+        ctx["split"] = round((halves[0].shape[1] - int(0.015 * region.shape[1])) / float(region.shape[1]), 4)
 
     results = []
     for hi, page in enumerate(halves):
@@ -429,7 +467,7 @@ def _process_segment(si: int, seg: Segment, frames: Dict[int, np.ndarray], cfg: 
                 if n_here > 0.001 * zone_px:
                     pf.append("finger_may_cover_text")
         pinfo = dict(info)
-        if cfg.dewarp:
+        if cfg.dewarp and ov.get("dewarp", True):
             try:
                 page, dinfo = dewarp(page)
                 pinfo["dewarp"] = dinfo
@@ -439,7 +477,7 @@ def _process_segment(si: int, seg: Segment, frames: Dict[int, np.ndarray], cfg: 
         if debug_dir:  # before lighting correction, to tune what comes after
             cv2.imwrite(os.path.join(debug_dir, f"seg{si:04d}_{hi}_raw.png"), page)
         page = flatten_illumination(page)
-        if cfg.dewarp:  # level lines can still sit in a leaning column; judged on even light
+        if cfg.dewarp and ov.get("deshear", ov.get("dewarp", True)):  # leaning column; judged on even light
             try:
                 page, sinfo = deshear(page)
                 pinfo.setdefault("dewarp", {}).update(sinfo)
@@ -463,6 +501,9 @@ def _process_segment(si: int, seg: Segment, frames: Dict[int, np.ndarray], cfg: 
         r = PageResult(0, si, ref_idx, ref_idx / fps, words=words, flags=pf, info=pinfo)
         r.text = words_to_text(words)
         r._image = page
+        r.ctx = ctx
+        if ov:
+            pf.append("adjusted")
         if len(halves) > 1:
             r.info["half"] = "left" if hi == 0 else "right"
             r.info["overlap_px"] = int(0.015 * region.shape[1])
@@ -540,6 +581,105 @@ def _save_stats(path: str, key: str, stats: FrameStats):
         log.warning("could not save analysis cache: %s", e)
 
 
+def write_pages(pages: List[PageResult], out_pages: str, cfg: Config) -> None:
+    """Number the pages and write their files: photo, scan, text and a sidecar
+    (words and context, for piffler fix). Pages fresh from processing carry
+    their image; pages kept from an earlier run carry their old files, which
+    are reused under the new numbers rather than made again."""
+    tmp = out_pages.rstrip("/\\") + "_tmp"
+    if os.path.exists(tmp):
+        shutil.rmtree(tmp)
+    os.makedirs(tmp)
+    for n, r in enumerate(pages, 1):
+        r.page_no = n
+        stem = os.path.join(tmp, f"page_{n:04d}")
+        img = getattr(r, "_image", None)
+        old = getattr(r, "_files", None)
+        if img is None and old:  # unchanged: reuse the files
+            for kind, src in old.items():
+                if src and os.path.exists(src):
+                    dst = stem + {"photo": "_photo.jpg", "txt": ".txt"}.get(kind, os.path.splitext(src)[1])
+                    shutil.copyfile(src, dst)
+                    if kind == "photo":
+                        r.photo_path = dst
+                    elif kind == "image":
+                        r.image_path = dst
+        elif img is not None:
+            cut = r.info.get("facing_cut_px")
+            if cut is not None:  # the facing page's strip at the gutter becomes paper
+                img = img.copy()
+                if r.info.get("half") == "left":
+                    img[:, cut:] = _paper_tone(img)
+                else:
+                    img[:, :cut] = _paper_tone(img)
+            r.photo_path = stem + "_photo.jpg"
+            cv2.imwrite(r.photo_path, img, [cv2.IMWRITE_JPEG_QUALITY, cfg.jpeg_quality])
+            r.image_path = r.photo_path
+            if cfg.scan:
+                try:
+                    side = {"left": "right", "right": "left"}.get(r.info.get("half"))  # binding side
+                    sc = clean_scan(img, upscale=cfg.scan_upscale, gutter=side,
+                                    overlap=r.info.get("overlap_px", 0), style=cfg.scan_style,
+                                    word_boxes=[w.box for w in r.words] or None)
+                    if cfg.scan_style == "bw":  # flat tones: PNG is small and exact
+                        r.image_path = stem + ".png"
+                        cv2.imwrite(r.image_path, sc)
+                    else:  # natural tones and photos: JPEG keeps the PDF a sensible size
+                        r.image_path = stem + ".jpg"
+                        cv2.imwrite(r.image_path, sc, [cv2.IMWRITE_JPEG_QUALITY, 92])
+                    r.image_scale = cfg.scan_upscale
+                except Exception as e:  # the photo is still there
+                    log.warning("scan cleanup failed on page %d: %s", n, e)
+                    r.image_path = r.photo_path
+        with open(stem + ".txt", "w", encoding="utf-8") as f:
+            f.write(r.text)
+        size = list(img.shape[:2]) if img is not None else getattr(r, "size", None)
+        r.size = size
+        side = {"words": [[w.text, round(float(w.score), 4), np.round(w.box, 1).tolist()] for w in r.words],
+                "image_scale": getattr(r, "image_scale", 1.0), "size": size, "ctx": getattr(r, "ctx", None)}
+        with open(stem + ".json", "w", encoding="utf-8") as f:
+            json.dump(side, f, ensure_ascii=False)
+    final = {}
+    for r in pages:  # paths now point into tmp; they move with it
+        for attr in ("photo_path", "image_path"):
+            v = getattr(r, attr, "")
+            if v:
+                final[(id(r), attr)] = os.path.join(out_pages, os.path.basename(v))
+    if os.path.exists(out_pages):
+        shutil.rmtree(out_pages)
+    os.replace(tmp, out_pages)
+    for r in pages:
+        for attr in ("photo_path", "image_path"):
+            if (id(r), attr) in final:
+                setattr(r, attr, final[(id(r), attr)])
+
+
+def load_overrides(out_dir: str) -> Dict[str, Dict]:
+    """overrides.json in the output folder: {page id: {setting: value}}."""
+    path = os.path.join(out_dir, "overrides.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return {k: v for k, v in json.load(f).items() if isinstance(v, dict)}
+    except (OSError, ValueError):
+        return {}
+
+
+def hold_overrides(ovs: Dict[str, Dict], si: int) -> Dict:
+    """Settings for hold `si` (processing is per hold, both halves at once)."""
+    out: Dict = {}
+    for key in (f"s{si}", f"s{si}-left", f"s{si}-right"):
+        out.update({k: v for k, v in ovs.get(key, {}).items() if k not in ("drop", "keep", "note", "score")})
+    return out
+
+
+def all_hold_frames(seg: Segment, step: int = 2, limit: int = 24) -> List[int]:
+    """Every `step`-th frame of a hold, its own candidates first (best-first)."""
+    rest = [i for i in range(seg.start, seg.end + 1, step) if i not in seg.candidates]
+    if len(rest) > limit:
+        rest = [rest[int(k)] for k in np.linspace(0, len(rest) - 1, limit)]
+    return list(seg.candidates) + rest
+
+
 def process_video(video_path: str, out_dir: str, cfg: Optional[Config] = None,
                   progress: Optional[Callable[[str, float], None]] = None) -> List[PageResult]:
     cfg = cfg or Config()
@@ -569,6 +709,13 @@ def process_video(video_path: str, out_dir: str, cfg: Optional[Config] = None,
             log.info("Reusing frame analysis from %s", cache_path)
         segs = find_segments(stats, cfg, fps)
         log.info("Found %d still segments", len(segs))
+        ovs = load_overrides(out_dir)
+        if ovs:
+            log.info("Applying %d page overrides from overrides.json", len(ovs))
+        for si, s_ in enumerate(segs):
+            if hold_overrides(ovs, si).get("frames") == "all":
+                s_.candidates = all_hold_frames(s_)
+                s_.scores = list(s_.scores) + [min(s_.scores)] * (len(s_.candidates) - len(s_.scores))
         if debug_dir:
             np.savetxt(os.path.join(debug_dir, "frame_stats.csv"),
                        np.stack([stats.idx, stats.t, stats.motion, stats.sharp, stats.bright, stats.skin], 1),
@@ -632,7 +779,7 @@ def process_video(video_path: str, out_dir: str, cfg: Optional[Config] = None,
             try:
                 extra = (replaces[0], replaces[4], replaces[5]) if replaces is not None and replaces[5] else None
                 rs = _process_segment(si, seg, frames, cfg, engine, orient, fps, out_pages, debug_dir,
-                                      prior, allow_defer, extra)
+                                      prior, allow_defer, extra, ov=hold_overrides(ovs, si))
             except _Deferred:
                 deferred[si] = frames
                 return True
@@ -700,44 +847,18 @@ def process_video(video_path: str, out_dir: str, cfg: Optional[Config] = None,
     pages = [r for r in results if r is not None]
     pages.sort(key=lambda r: (r.frame_index, r.info.get("half", "")))
     dropped = []
+    forced = [p for p in pages if ovs.get(p.id, {}).get("drop")]
+    pages = [p for p in pages if not ovs.get(p.id, {}).get("drop")]
+    dropped += [{"id": p.id, "segment": p.segment, "frame_index": p.frame_index, "time_s": round(p.time_s, 2),
+                 "half": p.info.get("half"), "chars": len(p.text), "reason": "dropped by override"} for p in forced]
     if cfg.dedupe:
-        pages, dropped = drop_repeats(pages)
+        pages, auto_dropped = drop_repeats(pages, keep={k for k, v in ovs.items() if v.get("keep")})
+        dropped += auto_dropped
         for d in dropped:
             log.info("dropped the %s page from frame %d: %s", d["half"] or "whole", d["frame_index"], d["reason"])
     if cfg.max_pages > 0:
         pages = pages[:cfg.max_pages]  # a spread can overshoot by one
-    for n, r in enumerate(pages, 1):
-        r.page_no = n
-        img = getattr(r, "_image", None)
-        if img is not None:
-            cut = r.info.get("facing_cut_px")
-            if cut is not None:  # the facing page's strip at the gutter becomes paper
-                img = img.copy()
-                if r.info.get("half") == "left":
-                    img[:, cut:] = _paper_tone(img)
-                else:
-                    img[:, :cut] = _paper_tone(img)
-            r.photo_path = os.path.join(out_pages, f"page_{n:04d}_photo.jpg")
-            cv2.imwrite(r.photo_path, img, [cv2.IMWRITE_JPEG_QUALITY, cfg.jpeg_quality])
-            r.image_path = r.photo_path
-            if cfg.scan:
-                try:
-                    side = {"left": "right", "right": "left"}.get(r.info.get("half"))  # binding side
-                    sc = clean_scan(img, upscale=cfg.scan_upscale, gutter=side,
-                                    overlap=r.info.get("overlap_px", 0), style=cfg.scan_style,
-                                    word_boxes=[w.box for w in r.words] or None)
-                    if cfg.scan_style == "bw":  # flat tones: PNG is small and exact
-                        r.image_path = os.path.join(out_pages, f"page_{n:04d}.png")
-                        cv2.imwrite(r.image_path, sc)
-                    else:  # natural tones and photos: JPEG keeps the PDF a sensible size
-                        r.image_path = os.path.join(out_pages, f"page_{n:04d}.jpg")
-                        cv2.imwrite(r.image_path, sc, [cv2.IMWRITE_JPEG_QUALITY, 92])
-                    r.image_scale = cfg.scan_upscale
-                except Exception as e:  # the photo is still there
-                    log.warning("scan cleanup failed on page %d: %s", n, e)
-                    r.image_path = r.photo_path
-            with open(os.path.join(out_pages, f"page_{n:04d}.txt"), "w", encoding="utf-8") as f:
-                f.write(r.text)
+    write_pages(pages, out_pages, cfg)
     meta = {"video": os.path.abspath(video_path), "fps": fps, "segments": len(segs), "dropped": dropped,
             "seconds": round(time.time() - t_start, 1), "config": cfg.to_dict()}
     write_outputs(out_dir, pages, meta, cfg.pdf)

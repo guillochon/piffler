@@ -38,6 +38,7 @@ dependencies = [
     "numpy>=1.22",
     "opencv-python-headless>=4.6",
     "rapidocr>=2.0",
+    "reportlab>=3.6",  # the searchable PDF
     # DirectML runs OCR on any DirectX 12 GPU and falls back to the CPU on its own;
     # elsewhere the stock build (with CoreML on macOS). For NVIDIA GPUs on Linux,
     # swap in onnxruntime-gpu: pip uninstall onnxruntime && pip install onnxruntime-gpu
@@ -46,7 +47,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-pdf = ["reportlab>=3.6"]
+pdf = []  # kept so "piffler[pdf]" still installs; reportlab is now a regular dependency
 test = ["pytest>=7"]
 
 [project.urls]
