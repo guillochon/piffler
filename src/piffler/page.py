@@ -18,16 +18,48 @@ def _order(pts: np.ndarray) -> np.ndarray:
     return np.array([pts[np.argmin(s)], pts[np.argmin(d)], pts[np.argmax(s)], pts[np.argmax(d)]], np.float32)
 
 
-def _text_density_map(img: np.ndarray, long_side: int = 1600) -> np.ndarray:
-    """Boolean map of small, thin dark marks (letters) at `long_side` resolution."""
-    s = min(1.0, long_side / max(img.shape[:2]))
-    g = cv2.cvtColor(cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
-    bh = cv2.morphologyEx(g, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9)))
-    n, lbl, st, _ = cv2.connectedComponentsWithStats((bh > 30).astype(np.uint8), 8)
+def _word_marks(g: np.ndarray) -> np.ndarray:
+    """Small, thin, wider-than-tall dark marks (words at this scale) in a gray image."""
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    closed = cv2.morphologyEx(g, cv2.MORPH_CLOSE, k).astype(np.float32)
+    # ink relative to the paper around it, so exposure and contrast don't matter
+    bh = closed - g.astype(np.float32)
+    n, lbl, st, _ = cv2.connectedComponentsWithStats((bh > 0.13 * np.maximum(closed, 40)).astype(np.uint8), 8)
     small = np.zeros(n, bool)
     # words, not dots: a strainer's mesh or speckled stone gives round marks
     small[1:] = (st[1:, 2] <= 40) & (st[1:, 3] <= 20) & (st[1:, 4] >= 3) & (st[1:, 2] >= 1.6 * st[1:, 3])
     return small[lbl]
+
+
+_SCALES = (1.0, 0.5, 0.25)
+
+
+def _text_density_map(img: np.ndarray, long_side: int = 1600) -> dict:
+    """Word-like marks at several scales, each map at `long_side` resolution.
+
+    Text can be a few pixels tall (a small book far from the camera) or large
+    (a big book filling the frame); each scale finds words about 3-20 px tall
+    there. A candidate page is then judged at the scale that suits its size."""
+    s = min(1.0, long_side / max(img.shape[:2]))
+    g = cv2.cvtColor(cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+    maps = {}
+    for f in _SCALES:
+        if f == 1.0:
+            maps[f] = _word_marks(g)
+        elif min(g.shape) * f >= 120:
+            gs = cv2.resize(g, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
+            m = cv2.resize(_word_marks(gs).astype(np.uint8), (g.shape[1], g.shape[0]), interpolation=cv2.INTER_NEAREST)
+            maps[f] = m > 0
+    return maps
+
+
+def _scale_for(page_h: float, maps: dict) -> float:
+    """The scale at which a page `page_h` pixels tall (at map resolution) shows
+    its words no taller than ~16 px (full scale already finds words 3-20 px
+    tall; coarser is only for pages so big their words outgrow that).
+    Words are roughly 1/60 of a page's height."""
+    ideal = min(1.0, 960.0 / max(page_h, 1.0))
+    return min(maps, key=lambda f: abs(np.log(f / ideal)))
 
 
 def _textiest_component(small: np.ndarray, L: np.ndarray, skin: Optional[np.ndarray],
@@ -52,8 +84,9 @@ def _textiest_component(small: np.ndarray, L: np.ndarray, skin: Optional[np.ndar
         if skin is not None:
             b[skin > 0] = 0
         # letters sit inside bright paper; speckle on a dark counter doesn't
-        surround = cv2.resize(cv2.blur(b, (5, 5)), (txt.shape[1], txt.shape[0]), interpolation=cv2.INTER_LINEAR)
-        marks = txt & (surround > 160)
+        any_map = next(iter(txt.values()))
+        surround = cv2.resize(cv2.blur(b, (5, 5)), (any_map.shape[1], any_map.shape[0]),
+                              interpolation=cv2.INTER_LINEAR) > 160
         b = cv2.morphologyEx(b, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         b = cv2.morphologyEx(b, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)))
         b = cv2.morphologyEx(b, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8))
@@ -68,9 +101,12 @@ def _textiest_component(small: np.ndarray, L: np.ndarray, skin: Optional[np.ndar
             solid = st[i, 4] / max(1.0, cv2.contourArea(hull))
             hm = np.zeros_like(comp)
             cv2.fillPoly(hm, [hull], 1)
-            hm = cv2.resize(hm, (txt.shape[1], txt.shape[0]), interpolation=cv2.INTER_NEAREST)
+            hm = cv2.resize(hm, (any_map.shape[1], any_map.shape[0]), interpolation=cv2.INTER_NEAREST)
+            f = _scale_for(st[i, 3] * any_map.shape[0] / float(sh), txt)  # judge it where its words are legible
+            marks = txt[f] & surround
             dens = float(marks[hm > 0].mean()) if hm.any() else 0.0
-            log.debug("t=%.0f comp %s area=%.3f dens=%.4f solid=%.2f", t, st[i, :4].tolist(), area, dens, solid)
+            log.debug("t=%.0f comp %s area=%.3f dens=%.4f solid=%.2f scale=%.2f", t, st[i, :4].tolist(),
+                      area, dens, solid, f)
             if solid < 0.6:  # a page merged with its surroundings
                 continue
             if prior is not None:

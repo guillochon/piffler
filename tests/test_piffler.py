@@ -18,7 +18,7 @@ import make_test_video as mtv  # noqa: E402
 
 from piffler import Config  # noqa: E402
 from piffler.dewarp import dewarp, find_lines, text_mask  # noqa: E402
-from piffler.hands import skin_mask  # noqa: E402
+from piffler.hands import occluder_mask, skin_mask  # noqa: E402
 from piffler.ocr import Word, reading_order, words_to_text  # noqa: E402
 from piffler.page import detect_page, split_pages  # noqa: E402
 from piffler.scan import clean_scan  # noqa: E402
@@ -88,6 +88,66 @@ def test_page_found_by_text_not_by_brightness():
     assert "page_by_brightness" not in flags
     cx, cy = quad.mean(0)
     assert x0 < cx < x1 and y0 < cy < y1
+
+
+@pytest.mark.parametrize("page_h", [420, 900, 1700])
+def test_page_found_by_text_at_any_size(page_h):
+    """Small book far away, or a big book filling the frame: found by its text either way."""
+    rng = np.random.default_rng(5)
+    h, w = 1920, 1080
+    scene = np.clip(rng.normal(140, 35, (h, w, 1)), 0, 255).astype(np.uint8).repeat(3, 2)
+    page, _ = mtv.render_page(*mtv.TEXTS[2], 9)
+    pw = min(int(page_h * 0.6), w - 40)
+    page = cv2.resize(page, (pw, page_h), interpolation=cv2.INTER_AREA if page_h < 1500 else cv2.INTER_CUBIC)
+    y0, x0 = (h - page_h) // 2, (w - pw) // 2
+    scene[y0:y0 + page_h, x0:x0 + pw] = page
+    if page_h <= 600:  # a bright, text-free decoy near a small page (not touching it)
+        cv2.circle(scene, (w // 2, 260), 220, (240, 241, 238), -1)
+    quad, _, flags = detect_page(scene)
+    assert "page_by_brightness" not in flags
+    qx0, qy0 = quad.min(0)
+    qx1, qy1 = quad.max(0)
+    iou_w = max(0, min(qx1, x0 + pw) - max(qx0, x0)) / max(qx1 - qx0, pw)
+    iou_h = max(0, min(qy1, y0 + page_h) - max(qy0, y0)) / max(qy1 - qy0, page_h)
+    assert iou_w > 0.85 and iou_h > 0.85
+
+
+@pytest.mark.parametrize("f", [0.6, 1.0, 1.8])
+def test_clean_scan_at_any_print_size(f):
+    page, _ = mtv.render_page(*mtv.TEXTS[0], 13)
+    page = cv2.resize(page, None, fx=f, fy=f, interpolation=cv2.INTER_AREA if f < 1 else cv2.INTER_CUBIC)
+    dim = (page.astype(np.float32) * 0.8 + 25).astype(np.uint8)
+    out = cv2.cvtColor(clean_scan(dim, upscale=1.0), cv2.COLOR_BGR2GRAY)
+    h, w = out.shape
+    inner = out[h // 5: 4 * h // 5, w // 6: 5 * w // 6]
+    assert 225 <= np.median(inner) < 255   # paper bright, in its own tone
+    assert (inner < 90).mean() > 0.005      # text still dark at this print size
+
+
+def test_occluder_mask_finds_any_colour():
+    page, _ = mtv.render_page(*mtv.TEXTS[1], 21)
+    page = cv2.resize(page, (500, 720))
+    rng = np.random.default_rng(2)
+    frames = [np.clip(page + rng.normal(0, 3, page.shape), 0, 255).astype(np.uint8) for _ in range(5)]
+    covered = frames[0].copy()
+    cv2.rectangle(covered, (0, 300), (180, 420), (70, 90, 60), -1)  # a dark green sleeve: no skin colour
+    region = np.full(page.shape[:2], 255, np.uint8)
+    m = occluder_mask(covered, frames[1:], region)
+    assert (m[320:400, 20:160] > 0).mean() > 0.8
+    assert (m[:250] > 0).mean() < 0.01   # the rest of the page is left alone
+    assert (occluder_mask(frames[0], frames[1:], region) > 0).mean() < 0.01
+
+
+def test_location_prior_turns_off_for_handheld_video():
+    from piffler.pipeline import _PagePrior
+    q = np.float32([[0, 0], [100, 0], [100, 140], [0, 140]])
+    stand, held = _PagePrior(), _PagePrior()
+    for d in (0, 2, -1, 3):
+        stand.add(q + d)
+    for d in (0, 40, -35, 25):
+        held.add(q + np.float32([d, d * 0.5]))
+    assert stand.get((200, 200)) is not None
+    assert held.get((200, 200)) is None
 
 
 def test_blank_spread_split_at_learned_gutter():

@@ -13,7 +13,7 @@ import numpy as np
 from .config import Config
 from .dewarp import dewarp, flatten_illumination, text_mask
 from .export import write_outputs
-from .hands import align_to, remove_fingers, skin_mask
+from .hands import align_to, occluder_mask, remove_fingers, skin_mask
 from .ocr import OCREngine, Word, best_rotation, rotate, words_to_text
 from .page import detect_page, rectify, split_pages
 from .scan import clean_scan
@@ -129,8 +129,17 @@ class _PagePrior:
     def gutter(self) -> Optional[float]:
         return float(np.median(self.gutters)) if self.gutters else None
 
+    def steady(self) -> bool:
+        """False when recent confident pages put the book in different places:
+        a hand-held phone, where a borrowed location would be wrong."""
+        if len(self.quads) < 3:
+            return True
+        Q = np.stack(self.quads)
+        diag = float(np.hypot(*(Q[-1].max(0) - Q[-1].min(0))))
+        return float(np.median(np.hypot(*(Q - np.median(Q, axis=0)).transpose(2, 0, 1)))) < 0.06 * diag
+
     def get(self, shape):
-        if not self.quads:
+        if not self.quads or not self.steady():
             return None
         quad = np.median(np.stack(self.quads), axis=0).astype(np.float32)
         mask = np.zeros(shape[:2], np.uint8)
@@ -212,10 +221,11 @@ def _consensus_cover(pool: Dict[int, np.ndarray], order: List[int], zone: np.nda
     stack = np.stack([cv2.GaussianBlur(grays[i], (5, 5), 0) for i in ids]).astype(np.float32)
     stack *= (np.median(stack[:, z]) + 1) / (np.median(stack[:, z], axis=1) + 1)[:, None, None]  # exposure
     med = np.median(stack, axis=0)
+    paper_lvl = float(np.percentile(med[z], 90))  # differences count relative to the paper's brightness
     k = np.ones((5, 5), np.uint8)  # wider than a misaligned stroke edge, narrower than a finger
     out = {}
     for i, g in zip(ids, stack):
-        dev = cv2.morphologyEx(((np.abs(g - med) > 28) & z).astype(np.uint8), cv2.MORPH_OPEN, k)
+        dev = cv2.morphologyEx(((np.abs(g - med) > 0.12 * paper_lvl) & z).astype(np.uint8), cv2.MORPH_OPEN, k)
         out[i] = float(dev[z].mean())
     return out
 
@@ -328,22 +338,33 @@ def _process_segment(si: int, seg: Segment, frames: Dict[int, np.ndarray], cfg: 
     frames, cands = pool, [ref_idx] + [i for i in order if i != ref_idx]
 
     clean = ref
+    covered_pts = None
     if cfg.remove_fingers:
         others = [frames[i] for i in cands[1:]]
-        clean, residual, fstats = remove_fingers(ref, others, pmask, cfg.skin_paper_delta)
+        occ = occluder_mask(ref, others, pmask)  # colour-free: catches what skin colour misses
+        clean, residual, fstats = remove_fingers(ref, others, pmask, cfg.skin_paper_delta, extra=occ)
+        fstats["occluder_frac"] = float((occ > 0).sum()) / max(1, int((pmask > 0).sum()))
         info["fingers"] = {k: round(v, 4) if isinstance(v, float) else v for k, v in fstats.items()}
         if residual.any():
             g = cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY)
             tm = text_mask(g)
-            near = cv2.dilate(residual, np.ones((25, 25), np.uint8))
-            covered = float(((tm > 0) & (near > 0) & (pmask > 0)).sum())
-            if covered > 0.0005 * pmask.astype(bool).sum() and fstats["residual_frac"] > 0.002:
-                flags.append("finger_may_cover_text")
+            kn = max(9, int(0.02 * max(ref.shape[:2])) | 1)
+            near = cv2.dilate(residual, np.ones((kn, kn), np.uint8))
+            cov = (tm > 0) & (near > 0) & (pmask > 0)
+            if cov.sum() > 0.0005 * pmask.astype(bool).sum() and fstats["residual_frac"] > 0.002:
+                ys, xs = np.nonzero(cov)
+                covered_pts = np.float32(np.stack([xs, ys], 1))  # assigned to a page after the split
         if debug_dir:
             cv2.imwrite(os.path.join(debug_dir, f"seg{si:04d}_ref.jpg"), _resize_long(ref, 1200))
             cv2.imwrite(os.path.join(debug_dir, f"seg{si:04d}_clean.jpg"), _resize_long(clean, 1200))
 
     region = rectify(clean, quad)
+    covered_x = None
+    if covered_pts is not None:  # where, across the rectified spread, fingers may hide text
+        rh, rw = region.shape[:2]
+        M = cv2.getPerspectiveTransform(quad.astype(np.float32),
+                                        np.float32([[0, 0], [rw - 1, 0], [rw - 1, rh - 1], [0, rh - 1]]))
+        covered_x = cv2.perspectiveTransform(covered_pts.reshape(-1, 1, 2), M).reshape(-1, 2)[:, 0]
     rot = 0 if cfg.rotate else orient.get(region)  # forced rotation is applied at decode
     if rot:
         region = rotate(region, rot)
@@ -361,6 +382,14 @@ def _process_segment(si: int, seg: Segment, frames: Dict[int, np.ndarray], cfg: 
     results = []
     for hi, page in enumerate(halves):
         pf = list(flags)
+        if covered_x is not None:
+            if len(halves) == 1 or rot:
+                pf.append("finger_may_cover_text")
+            else:  # only the page the hidden text is on
+                gx = halves[0].shape[1] - int(0.015 * region.shape[1])  # the split line
+                n_here = int((covered_x < gx).sum() if hi == 0 else (covered_x >= gx).sum())
+                if n_here > 0.00025 * pmask.astype(bool).sum():
+                    pf.append("finger_may_cover_text")
         pinfo = dict(info)
         if cfg.dewarp:
             try:
@@ -548,7 +577,7 @@ def process_video(video_path: str, out_dir: str, cfg: Optional[Config] = None,
                     done.add(si)
                     # past --max-pages, only repeat holds of the last page still help it
                     stop = not finish(si, repeats_only=full) or stop
-            if deferred and prior.quads and prior.gutters:
+            if deferred and prior.quads and (prior.gutters or not prior.steady()):
                 for si in sorted(deferred):
                     finish(si, allow_defer=False)
             if enough() and not full:

@@ -161,9 +161,48 @@ def align_to(ref: np.ndarray, img: np.ndarray, ref_mask: Optional[np.ndarray] = 
     return H
 
 
+def occluder_mask(ref: np.ndarray, others: List[np.ndarray], region: Optional[np.ndarray] = None,
+                  long_side: int = 600) -> np.ndarray:
+    """Whatever covers the page in ``ref`` but not in most other frames, whatever
+    its colour: a hand of any skin tone, a sleeve, a pen. The other frames are
+    aligned to ``ref`` and their per-pixel median shows the uncovered page;
+    sizeable blobs where ``ref`` differs from it are occluders (uint8 mask)."""
+    h, w = ref.shape[:2]
+    out = np.zeros((h, w), np.uint8)
+    s = min(1.0, long_side / max(h, w))
+    small = lambda im: cv2.resize(im, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+    r = small(ref)
+    sh, sw = r.shape[:2]
+    stack = []
+    for o in others:
+        if o is None or o.shape != ref.shape:
+            continue
+        os_ = small(o)
+        H = align_to(r, os_)
+        if H is not None:
+            stack.append(cv2.warpPerspective(cv2.cvtColor(os_, cv2.COLOR_BGR2GRAY), H, (sw, sh),
+                                             borderMode=cv2.BORDER_REPLICATE).astype(np.float32))
+    if len(stack) < 3:  # too few views to tell page from occluder
+        return out
+    g = cv2.GaussianBlur(cv2.cvtColor(r, cv2.COLOR_BGR2GRAY), (5, 5), 0).astype(np.float32)
+    S = np.stack([cv2.GaussianBlur(x, (5, 5), 0) for x in stack])
+    reg = cv2.resize(region, (sw, sh), interpolation=cv2.INTER_NEAREST) > 0 if region is not None         else np.ones((sh, sw), bool)
+    S *= (np.median(g[reg]) + 1) / (np.median(S[:, reg], axis=1) + 1)[:, None, None]  # exposure
+    med = np.median(S, axis=0)
+    lvl = float(np.percentile(med[reg], 90))
+    dev = ((np.abs(g - med) > 0.12 * lvl) & reg).astype(np.uint8)
+    dev = cv2.morphologyEx(dev, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))  # drop misaligned stroke edges
+    n, lbl, st, _ = cv2.connectedComponentsWithStats(dev, 8)
+    keep = np.zeros(n, bool)
+    keep[1:] = st[1:, 4] > 0.002 * reg.sum()
+    m = cv2.dilate(keep[lbl].astype(np.uint8) * 255, np.ones((3, 3), np.uint8))
+    return cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
+
+
 def remove_fingers(ref: np.ndarray, others: List[np.ndarray], region: Optional[np.ndarray] = None,
-                   paper_delta: float = 14.0) -> Tuple[np.ndarray, np.ndarray, dict]:
+                   paper_delta: float = 14.0, extra: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray, dict]:
     """Remove hands from ``ref`` using other frames of the same still page.
+    ``extra`` adds occluders found some other way (see ``occluder_mask``).
 
     Returns (clean_image, residual_mask, stats). Pixels that no other frame can
     fill are painted with the local paper background (good for margins); if
@@ -171,6 +210,9 @@ def remove_fingers(ref: np.ndarray, others: List[np.ndarray], region: Optional[n
     """
     stats = {"finger_px_frac": 0.0, "filled_from_frames": 0.0, "residual_frac": 0.0, "aligned": 0}
     mask = skin_mask(ref, region, paper_delta, pale=True)
+    skin_only = mask.copy()
+    if extra is not None:
+        mask = cv2.bitwise_or(mask, extra)
     if region is not None:
         mask_in = cv2.bitwise_and(mask, region)
     else:
@@ -186,9 +228,10 @@ def remove_fingers(ref: np.ndarray, others: List[np.ndarray], region: Optional[n
     R = max(5, int(0.025 * max(h, w)))
     near = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * R + 1, 2 * R + 1)))
     L = cv2.cvtColor(ref, cv2.COLOR_BGR2LAB)[..., 0]
-    bgL = cv2.morphologyEx(L, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))  # paper level, print removed
+    kb = max(5, int(0.008 * max(h, w)) | 1)  # wider than a stroke at any print size
+    bgL = cv2.morphologyEx(L, cv2.MORPH_CLOSE, np.ones((kb, kb), np.uint8))  # paper level, print removed
     paper = paper_color_lab(ref, region)
-    shadow = ((near > 0) & (core == 0) & (bgL < paper[0] - 6)).astype(np.uint8) * 255
+    shadow = ((near > 0) & (core == 0) & (bgL < 0.975 * paper[0])).astype(np.uint8) * 255
     if region is not None:
         shadow = cv2.bitwise_and(shadow, region)
     need = cv2.bitwise_or(core, shadow)
@@ -209,15 +252,16 @@ def remove_fingers(ref: np.ndarray, others: List[np.ndarray], region: Optional[n
         # require the donor to agree with the reference just around the hand: a
         # frame that aligned badly (the book shifted, the page flexed) would paste
         # smeared print into the hole
-        ring = (cv2.dilate(need, np.ones((31, 31), np.uint8)) > 0) & (need == 0) & (okm > 0) & (mask == 0)
-        if ring.sum() > 200:
+        kr = max(9, int(0.025 * max(h, w)) | 1)
+        ring = (cv2.dilate(need, np.ones((kr, kr), np.uint8)) > 0) & (need == 0) & (okm > 0) & (mask == 0)
+        if ring.sum() > 2e-4 * h * w:
             gr = cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY).astype(np.float32)
             gw = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY).astype(np.float32)
             gw *= (gr[ring].mean() + 1) / (gw[ring].mean() + 1)  # exposure drift
             # compare print, not paper: the error over the darker (inked) ring pixels
             inked = ring & (gr < np.percentile(gr[ring], 30))
             err = float(np.median(np.abs(gr[inked] - gw[inked]))) if inked.sum() > 50 else 0.0
-            if err > 18:
+            if err > 0.08 * gr[ring].mean():  # misfit print, judged against the paper's brightness
                 stats["rejected"] = stats.get("rejected", 0) + 1
                 continue
         stack.append(warped)
@@ -234,7 +278,8 @@ def remove_fingers(ref: np.ndarray, others: List[np.ndarray], region: Optional[n
             Vf = V[:, fillable]
             med = np.nanmedian(np.where(Vf[..., None], Sf, np.nan), axis=0)
             # match donor brightness to the reference (exposure drifts between frames)
-            ring = (cv2.dilate(need, np.ones((15, 15), np.uint8)) > 0) & (need == 0) & (cnt > 0)
+            kr2 = max(7, int(0.012 * max(h, w)) | 1)
+            ring = (cv2.dilate(need, np.ones((kr2, kr2), np.uint8)) > 0) & (need == 0) & (cnt > 0)
             if ring.sum() > 50:
                 Rf = np.stack([st[ring] for st in stack]).astype(np.float32)
                 donor = np.nanmedian(np.where(V[:, ring][..., None], Rf, np.nan), axis=0)
@@ -246,7 +291,10 @@ def remove_fingers(ref: np.ndarray, others: List[np.ndarray], region: Optional[n
 
     # a shadow no frame could fill stays: lighting correction evens out smooth
     # shading, while painting paper there would erase any print beneath it
-    residual = cv2.bitwise_and(remaining, core)
+    # likewise an occluder seen only by the frames disagreeing (not as skin):
+    # if no frame can fill it, leave it rather than risk painting over print
+    skin_core = cv2.dilate(skin_only, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * pad + 1, 2 * pad + 1)))
+    residual = cv2.bitwise_and(remaining, skin_core)
     if residual.any():
         out = fill_with_paper(out, residual)
     if region is not None:

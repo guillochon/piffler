@@ -93,11 +93,21 @@ def _paper_mask(gray: np.ndarray) -> np.ndarray:
     return cv2.resize(m * 255, (w, h), interpolation=cv2.INTER_LINEAR) > 127
 
 
+def _stroke_width(ink: np.ndarray) -> float:
+    """Typical stroke width of the print, in pixels (2x the distance to the
+    nearest paper, taken at stroke centres)."""
+    if ink.sum() < 2e-4 * ink.size:
+        return 2.0
+    dt = cv2.distanceTransform(ink.astype(np.uint8), cv2.DIST_L2, 3)
+    ridge = (dt >= cv2.dilate(dt, np.ones((3, 3), np.uint8))) & (dt > 0)
+    return float(np.clip(2.0 * np.median(dt[ridge]), 1.0, 40.0)) if ridge.any() else 2.0
+
+
 def _stroke_level(norm: np.ndarray, paper: np.ndarray, pics: np.ndarray) -> float:
     """How dark this page's text strokes really are (thin print blurs to grey)."""
     cores = cv2.erode(norm, np.ones((5, 5), np.uint8))
     v = cores[paper & ~pics & (cores < 0.9)]
-    return float(np.percentile(v, 30)) if v.size > 200 else 0.5
+    return float(np.percentile(v, 30)) if v.size > 2e-4 * norm.size else 0.5
 
 
 def _faint_marks(tone: np.ndarray, paper: np.ndarray, pics: np.ndarray) -> np.ndarray:
@@ -185,7 +195,7 @@ def _faint_outside_text(tone: np.ndarray, paper: np.ndarray, pics: np.ndarray,
         block = cv2.dilate(block, np.ones((2 * ry + 1, 2 * rx + 1), np.uint8))
     else:
         ys, xs = np.nonzero((tone < 0.35) & paper & ~pics)
-        if len(xs) < 200:
+        if len(xs) < 2e-4 * tone.size:
             return np.zeros(tone.shape, bool)
         x0, x1 = np.percentile(xs, [0.5, 99.5])
         y0, y1 = np.percentile(ys, [0.5, 99.5])
@@ -220,6 +230,7 @@ def clean_scan(img: np.ndarray, color: Optional[bool] = None, upscale: float = 2
     pixels past the binding the page was cut: marks lying wholly in that
     strip are the facing page's."""
     bw = style == "bw"
+    up = upscale or 1
     if upscale and upscale != 1:
         img = cv2.resize(img, None, fx=upscale, fy=upscale, interpolation=cv2.INTER_CUBIC)
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
@@ -236,8 +247,14 @@ def clean_scan(img: np.ndarray, color: Optional[bool] = None, upscale: float = 2
         paper |= pics
     bg = paper_background(lab[..., 0], pics)
     norm = np.clip(gray / np.maximum(bg, 20), 0, 1.2)
+    # the page's own text scale: line height from OCR boxes, else from the print
+    if word_boxes:
+        line_h = up * float(np.median([np.ptp(np.asarray(b)[:, 1]) for b in word_boxes]))
+    else:
+        line_h = 8.0 * _stroke_width(norm < 0.7)
     # sharpen print (not pictures): recovers stroke contrast lost to optics and compression
-    sig = max(1.0, 0.6 * (upscale or 1))
+    # sharpen at the scale of the strokes themselves
+    sig = max(1.0, 0.5 * _stroke_width(norm < 0.7))
     sharp = norm + (0.9 if bw else 0.6) * (norm - cv2.GaussianBlur(norm, (0, 0), sig))
     # levels: paper to white, the typical stroke core to near-black
     black = _stroke_level(sharp, paper, pics) - (0.08 if bw else 0.05)
@@ -259,7 +276,8 @@ def clean_scan(img: np.ndarray, color: Optional[bool] = None, upscale: float = 2
         # a dense, tall block against the binding is part of the facing page's
         # picture; text running to the binding is never that solid
         Hh, W = tone.shape
-        dense = cv2.morphologyEx((tone < 0.6).astype(np.uint8), cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+        kd = max(5, int(0.6 * line_h) | 1)  # closes the gaps between words, not between lines
+        dense = cv2.morphologyEx((tone < 0.6).astype(np.uint8), cv2.MORPH_CLOSE, np.ones((kd, kd), np.uint8))
         n, lbl, st, _ = cv2.connectedComponentsWithStats(dense, 8)
         for i in range(1, n):
             x, y, ww, hh, a = st[i]
@@ -275,7 +293,6 @@ def clean_scan(img: np.ndarray, color: Optional[bool] = None, upscale: float = 2
         inside[0] = False
         tone[inside[lbl]] = 1.0
     tone[_faint_marks(tone, paper, pics)] = 1.0
-    up = upscale or 1
     boxes = [np.asarray(b, np.float32) * up for b in word_boxes] if word_boxes else None
     tone[_faint_outside_text(tone, paper, pics, boxes)] = 1.0
     if pics.any():
@@ -287,7 +304,7 @@ def clean_scan(img: np.ndarray, color: Optional[bool] = None, upscale: float = 2
         if color is None:  # colour only where the print itself is coloured
             chroma = np.hypot(lab[..., 1].astype(np.float32) - 128, lab[..., 2].astype(np.float32) - 128)
             ink = tone < 0.5
-            color = bool(ink.sum() > 500 and np.percentile(chroma[ink], 90) > 18)
+            color = bool(ink.sum() > 2e-4 * ink.size and np.percentile(chroma[ink], 90) > 18)
         if not color:
             return out8
         lab2 = lab.copy()
@@ -296,7 +313,7 @@ def clean_scan(img: np.ndarray, color: Optional[bool] = None, upscale: float = 2
         return cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
     # natural: the page's own paper colour, lightened as a good scanner would
     sheet = paper & ~pics & (tone > 0.97)
-    pl = np.median(lab[sheet].reshape(-1, 3), axis=0).astype(np.float32) if sheet.sum() > 500         else np.array([240, 128, 130], np.float32)
+    pl = np.median(lab[sheet].reshape(-1, 3), axis=0).astype(np.float32) if sheet.sum() > 2e-4 * sheet.size         else np.array([240, 128, 130], np.float32)
     paper_L = float(np.clip(pl[0] * 1.05, 232, 246))
     tint = np.clip(pl[1:] - 128, -6, 8)  # keep a hint of the paper's colour, never a cast
     ink_L = 22.0
